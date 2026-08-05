@@ -1,0 +1,226 @@
+"""Local tools and their shared interface."""
+
+import asyncio
+import glob as globlib
+import json
+import os
+import re
+from pathlib import Path
+from typing import Any, ClassVar, Literal, Protocol
+
+from pydantic import BaseModel
+
+_RESET = "\033[0m"
+_DIM = "\033[2m"
+
+
+class Tool(Protocol):
+    type: str
+    name: str
+    description: str
+    parameters: dict[str, Any]
+
+    async def run(self, arguments: dict[str, Any]) -> str: ...
+
+
+TodoStatus = Literal["pending", "in_progress", "completed"]
+
+
+# single todo item
+class TodoItem(BaseModel):
+    content: str
+    status: TodoStatus
+
+
+class TodoWriteArguments(BaseModel):
+    todos: list[TodoItem]
+
+
+class ReadArguments(BaseModel):
+    path: str
+    offset: int = 0
+    limit: int | None = None
+
+
+class TodoWriteTool:
+    type = "function"
+    name = "todo_write"
+    description = "Create and manage a task list. Upload entire task list every time."
+    arguments_model = TodoWriteArguments
+    parameters: ClassVar[dict[str, Any]] = TodoWriteArguments.model_json_schema()
+
+    async def run(self, arguments: dict[str, Any]) -> str:
+        todo_list = self.arguments_model.model_validate(arguments).todos
+        lines = []
+        for todo in todo_list:
+            icon = {"pending": " ", "in_progress": "▸", "completed": "✓"}[todo.status]
+            lines.append(f"  [{icon}] {todo.content}")
+        print("\n".join(lines))
+        serialized = [todo.model_dump() for todo in todo_list]
+        return f"Updated todo_list: {json.dumps(serialized, ensure_ascii=False)}"
+
+
+class ReadTool:
+    type = "function"
+    name = "read"
+    description = "Read file with line numbers (file path, not directory)"
+    parameters: ClassVar[dict[str, Any]] = ReadArguments.model_json_schema()
+    arguments_model = ReadArguments
+
+    async def run(self, arguments: dict[str, Any]) -> str:
+        args = self.arguments_model.model_validate(arguments)
+        lines = await asyncio.to_thread(Path(args.path).read_text)
+        lines = lines.splitlines(keepends=True)
+        limit = args.limit if args.limit is not None else len(lines)
+        selected = lines[args.offset : args.offset + limit]
+        return "".join(
+            f"{args.offset + index + 1:4}| {line}"
+            for index, line in enumerate(selected)
+        )
+
+
+class WriteArguments(BaseModel):
+    path: str
+    content: str
+
+
+class WriteTool:
+    type = "function"
+    name = "write"
+    description = "Write content to file"
+
+    parameters: ClassVar[dict[str, Any]] = WriteArguments.model_json_schema()
+    arguments_model = WriteArguments
+
+    async def run(self, arguments: dict[str, Any]) -> str:
+        args = self.arguments_model.model_validate(arguments)
+        await asyncio.to_thread(Path(args.path).write_text, args.content)
+        return "ok"
+
+
+class EditArguments(BaseModel):
+    path: str
+    old: str
+    new: str
+    all: bool = False
+
+
+class EditTool:
+    type = "function"
+    name = "edit"
+    description = "Replace old with new in file (old must be unique unless all=true)"
+    parameters: ClassVar[dict[str, Any]] = EditArguments.model_json_schema()
+    arguments_model = EditArguments
+
+    async def run(self, arguments: dict[str, Any]) -> str:
+        args = self.arguments_model.model_validate(arguments)
+        path = Path(args.path)
+        text = await asyncio.to_thread(path.read_text)
+        if args.old not in text:
+            return "error: old_string not found"
+        count = text.count(args.old)
+        if not args.all and count > 1:
+            return (
+                f"error: old_string appears {count} times, "
+                "must be unique (use all=true)"
+            )
+        replacement = (
+            text.replace(args.old, args.new)
+            if args.all
+            else text.replace(args.old, args.new, 1)
+        )
+        await asyncio.to_thread(path.write_text, replacement)
+        return "ok"
+
+
+class GlobArguments(BaseModel):
+    pat: str
+    path: str = "."
+
+
+class GlobTool:
+    type = "function"
+    name = "glob"
+    description = "Find files by pattern, sorted by mtime"
+    parameters: ClassVar[dict[str, Any]] = GlobArguments.model_json_schema()
+    arguments_model = GlobArguments
+
+    async def run(self, arguments: dict[str, Any]) -> str:
+        args = self.arguments_model.model_validate(arguments)
+        pattern = (args.path + "/" + args.pat).replace("//", "/")
+        files = globlib.glob(pattern, recursive=True)
+        files = sorted(
+            files,
+            key=lambda path: os.path.getmtime(path) if os.path.isfile(path) else 0,
+            reverse=True,
+        )
+        return "\n".join(files) or "none"
+
+
+class GrepArguments(BaseModel):
+    pat: str
+    path: str = "."
+
+
+class GrepTool:
+    type = "function"
+    name = "grep"
+    description = "Search files for regex pattern"
+    parameters: ClassVar[dict[str, Any]] = GrepArguments.model_json_schema()
+    arguments_model = GrepArguments
+
+    async def run(self, arguments: dict[str, Any]) -> str:
+        args = self.arguments_model.model_validate(arguments)
+        pattern = re.compile(args.pat)
+        hits = await asyncio.to_thread(_grep_files, args.path, pattern)
+        return "\n".join(hits[:50]) or "none"
+
+
+def _grep_files(path: str, pattern: re.Pattern[str]) -> list[str]:
+    hits: list[str] = []
+    for filepath in globlib.glob(path + "/**", recursive=True):
+        try:
+            lines = Path(filepath).read_text().splitlines()
+        except (OSError, UnicodeError):
+            continue
+        for line_number, line in enumerate(lines, 1):
+            if pattern.search(line):
+                hits.append(f"{filepath}:{line_number}:{line}")
+    return hits
+
+
+class BashArguments(BaseModel):
+    cmd: str
+
+
+class BashTool:
+    type = "function"
+    name = "bash"
+    description = "Run shell command"
+    parameters: ClassVar[dict[str, Any]] = BashArguments.model_json_schema()
+    arguments_model = BashArguments
+
+    async def run(self, arguments: dict[str, Any]) -> str:
+        args = self.arguments_model.model_validate(arguments)
+        process = await asyncio.create_subprocess_shell(
+            args.cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        output_lines: list[str] = []
+
+        async def collect_output() -> None:
+            assert process.stdout is not None
+            while line := await process.stdout.readline():
+                text = line.decode(errors="replace")
+                print(f"  {_DIM}│ {text.rstrip()}{_RESET}", flush=True)
+                output_lines.append(text)
+            await process.wait()
+
+        try:
+            await asyncio.wait_for(collect_output(), timeout=30)
+        except TimeoutError:
+            process.kill()
+            await process.wait()
+            output_lines.append("\n(timed out after 30s)")
+        return "".join(output_lines).strip() or "(empty)"
