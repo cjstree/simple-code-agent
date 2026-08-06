@@ -24,6 +24,7 @@ from code_agent.tool import (
     WriteTool,
 )
 from code_agent.tool_registry import ToolRegistry
+from code_agent.context_manager import ContextManager
 
 OPENROUTER_KEY = None
 MODEL = settings.llm_model_name
@@ -86,6 +87,7 @@ class Agent:
     system_prompt: str
     max_tool_round: int
     hooks: dict[str, list[callable]]
+    context_manager : ContextManager
 
     def __init__(self, telemetry: AgentTelemetry | None = None):
         self.telemetry = telemetry or AgentTelemetry()
@@ -121,6 +123,7 @@ class Agent:
                 api_key=settings.llm_api_key,
                 base_url=settings.llm_base_url,
             )
+            self.context_manager = ContextManager(self.client)
             tool_list = [
                 ReadTool(),
                 BashTool(),
@@ -175,6 +178,9 @@ class Agent:
                     print(f"{GREEN}⏺ Cleared conversation{RESET}")
                     continue
 
+                # compact message
+                self.messages = self.context_manager.compact(self.messages)
+                # start a new span
                 with self.telemetry.trace_turn(
                     session_id=self.session_id, prompt=user_input
                 ) as turn_span:
@@ -188,6 +194,8 @@ class Agent:
     async def _tool_call_loop(self):
         cur_round = 0
         while cur_round < self.max_tool_round:
+            # compact tool res before send to llm
+            self.messages =  self.context_manager._tool_res_compact(self.messages)
             # call the llm.
             resp = self._call_api(self.messages, self.system_prompt)
             self.messages.append(rsp2msg(resp))
