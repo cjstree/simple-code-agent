@@ -224,3 +224,23 @@ class BashTool:
             await process.wait()
             output_lines.append("\n(timed out after 30s)")
         return "".join(output_lines).strip() or "(empty)"
+
+class LoadSkillsArguments(BaseModel):
+    skill_name: str
+
+class LoadSkillsTool:
+    type = "function"
+    name = "load_skills"
+    description = "load an exist skill."
+    parameters: ClassVar[dict[str, Any]] = LoadSkillsArguments.model_json_schema()
+    arguments_model = LoadSkillsArguments
+    skill_registry = {} 
+    def __init__(self,skill_registry : dict[str,dict] | None = {}):
+        self.skill_registry = skill_registry
+    async def run(self, arguments: dict[str, Any]) -> str:
+        args = self.arguments_model.model_validate(arguments)
+        name = args.skill_name
+        if not args in self.arguments_model:
+            return f"error: skill name: {name} not found!"
+        else :
+            return self.skill_registry[name]['content']

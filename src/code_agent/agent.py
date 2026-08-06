@@ -2,6 +2,7 @@
 
 import json
 import os
+from pathlib import Path
 import re
 import uuid
 from contextlib import AsyncExitStack
@@ -19,6 +20,7 @@ from code_agent.tool import (
     EditTool,
     GlobTool,
     GrepTool,
+    LoadSkillsTool,
     ReadTool,
     TodoWriteTool,
     WriteTool,
@@ -26,8 +28,11 @@ from code_agent.tool import (
 from code_agent.tool_registry import ToolRegistry
 from code_agent.context_manager import ContextManager
 
+import yaml
+
 OPENROUTER_KEY = None
 MODEL = settings.llm_model_name
+SKILLS_DIR = None
 
 # ANSI colors
 RESET, BOLD, DIM = "\033[0m", "\033[1m", "\033[2m"
@@ -77,6 +82,19 @@ def rsp2msg(resp):
         ),
     }
 
+def _parse_frontmatter(text: str) -> tuple[dict, str]:
+    """Parse YAML frontmatter from SKILL.md. Returns (meta, body)."""
+    if not text.startswith("---"):
+        return {}, text
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return {}, text
+    try:
+        meta = yaml.safe_load(parts[1]) or {}
+    except yaml.YAMLError:
+        meta = {}
+    return meta, parts[2].strip()
+
 
 class Agent:
     "an agent implemention. using cli command to intereact. can use tools."
@@ -88,6 +106,7 @@ class Agent:
     max_tool_round: int
     hooks: dict[str, list[callable]]
     context_manager : ContextManager
+    skill_registry : dict[str,dict]
 
     def __init__(self, telemetry: AgentTelemetry | None = None):
         self.telemetry = telemetry or AgentTelemetry()
@@ -99,6 +118,23 @@ class Agent:
             "PostToolUse": [],
             "Stop": [],
         }
+    def _list_skills(self) -> str:
+        return "\n".join(f"- **{s['name']}**: {s['description']}" for s in self.skill_registry.values())
+
+    def _scan_skills(self,skills_dir : Path| None = None):
+        self.skill_registry = {}
+        if not skills_dir.exists():
+            return
+        for d in sorted(skills_dir.iterdir()):
+            if not d.is_dir():
+                continue
+            manifest = d / "SKILL.md"
+            if manifest.exists():
+                raw = manifest.read_text()
+                meta, body = _parse_frontmatter(raw)
+                name = meta.get("name", d.name)
+                desc = meta.get("description", raw.split("\n")[0].lstrip("#").strip())
+                self.skill_registry[name] = {"name": name, "description": desc, "content": raw}
 
     def registHook(self, event: str, func: callable):
         self.hooks[event].append(func)
@@ -123,6 +159,7 @@ class Agent:
                 api_key=settings.llm_api_key,
                 base_url=settings.llm_base_url,
             )
+            self._scan_skills()
             self.context_manager = ContextManager(self.client)
             tool_list = [
                 ReadTool(),
@@ -132,6 +169,7 @@ class Agent:
                 GrepTool(),
                 WriteTool(),
                 TodoWriteTool(),
+                LoadSkillsTool(self.skill_registry),
             ]
             async with AsyncExitStack() as stack:
                 if settings.mcp_url:
@@ -150,7 +188,8 @@ class Agent:
                     tools=tool_list,
                     sensitive_tools={"bash", "edit", "write"},
                 )
-                self.system_prompt = f"Concise coding assistant. cwd: {os.getcwd()}"
+                self.system_prompt = f"""Concise coding assistant. cwd: {os.getcwd()}.
+                                         available skill:{self._list_skills()}"""
                 self.max_tool_round = 5
                 await self._loop()
         finally:
