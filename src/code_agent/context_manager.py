@@ -15,6 +15,19 @@ def is_tool_use_msg(msg:dict[str,str]) -> bool:
 def is_tool_call_res(msg:dict[str,str]) -> bool:
     return msg["role"] == "tool"
 
+# find the boundary of a tool call round
+# message structure:
+# user_input -> resp(inclue tool use) -> tool_call_res -> tool_call_res -> resp(inclue tool use) -> tool_call_res -> resp(without tool_call)
+def tool_call_range(messages:list[dict[str,str]],idx : int) :
+    while is_tool_call_res(messages[idx]):
+            idx -= 1
+    tail = idx + 1
+    while tail < len(messages) and is_tool_call_res(messages[tail]):
+        tail += 1
+    return idx,tail
+
+
+
 class ContextManager:
 
     max_messages : int
@@ -50,23 +63,24 @@ class ContextManager:
 
 
     # keep the message length not too long
-    # TODO: Keep assistant tool_calls and all matching tool_call_id results atomic when snipping.
+    # Keep assistant tool_calls and all matching tool_call_id results atomic when snipping.
     def _snip_compact(self,messages:list[dict[str,str]]) -> list[dict[str,str]]:
         if len(messages) <= self.max_messages:
             return messages
         head_end, tail_start = 3, len(messages) - (self.max_messages - 3)
-        if head_end > 0 and is_tool_use_msg(messages[head_end - 1]):
-            while head_end < len(messages) and is_tool_call_res(messages[head_end]):
-                head_end += 1
-        if (tail_start > 0 and tail_start < len(messages)
-                and is_tool_call_res(messages[tail_start])
-                and is_tool_call_res(messages[tail_start - 1])):
+
+
+        while head_end < len(messages) and is_tool_call_res(messages[head_end]):
+            head_end += 1
+
+        while is_tool_call_res(messages[tail_start]):
             tail_start -= 1
         snipped = tail_start - head_end
         placeholder = {"role": "user", "content": f"[snipped {snipped} messages from conversation middle]"}
         return messages[:head_end] + [placeholder] + messages[tail_start:]
 
-    # remove some old tool use result.
+    # Prefer keeping the newest max_tool_res results. Older short results may stay
+    # unchanged, so max_tool_res is not a hard cap on the number of tool messages.
     def _micro_compact(self,messages:list[dict[str,str]]) -> list[dict[str,str]]:
         cnt = 0
         for message in messages:
@@ -79,7 +93,7 @@ class ContextManager:
                         message['content'] = """<tool-result-truncated>
                         Earlier tool result compacted. Re-run if needed with refined parameters if needed.
                         </tool-result-truncated>"""
-                cnt -= 1
+                    cnt -= 1
             else :
                 break
         return messages

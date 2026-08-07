@@ -36,3 +36,15 @@ uv run pytest
 uv run ruff check .
 uv run ruff format --check .
 ```
+
+# Test
+
+  uv run python -m pytest -q
+
+  只运行 ContextManager 测试：
+
+  uv run python -m pytest tests/test_context_manager.py -q
+
+  只运行 skills 测试：
+
+  uv run python -m pytest tests/test_skills.py -q

@@ -161,7 +161,7 @@ class Agent:
                 api_key=settings.llm_api_key,
                 base_url=settings.llm_base_url,
             )
-            self._scan_skills(skills_dir="./skills")
+            self._scan_skills(skills_dir= Path("./skills"))
             self.context_manager = ContextManager(self.client)
             tool_list = [
                 ReadTool(),

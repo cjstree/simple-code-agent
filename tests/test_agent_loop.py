@@ -4,6 +4,7 @@ from typing import Any
 import pytest
 
 from code_agent.agent import Agent
+from code_agent.context_manager import ContextManager
 from code_agent.settings import settings
 from code_agent.telemetry import AgentTelemetry
 
@@ -52,6 +53,7 @@ async def test_agent_starts_with_local_tools_and_no_mcp(
         "edit",
         "glob",
         "grep",
+        "load_skills",
         "read",
         "todo_write",
         "write",
@@ -97,12 +99,13 @@ async def test_agent_completes_one_tool_call_cycle() -> None:
     agent = Agent()
     registry = FakeRegistry()
     agent.tool_registry = registry  # type: ignore[assignment]
+    agent.context_manager = ContextManager(object())
     agent.messages = [{"role": "user", "content": "run the tool"}]
     agent.system_prompt = "test"
     agent.max_tool_round = 3
     agent._call_api = lambda messages, system_prompt: next(responses)  # type: ignore[method-assign]
 
-    await agent._tool_call_loop()
+    await agent._agent_loop()
 
     assert registry.calls == [("echo", {"value": 2})]
     assert [message["role"] for message in agent.messages] == [
@@ -143,12 +146,13 @@ async def test_agent_passes_sensitive_tool_decision_to_registry(
     agent = Agent()
     registry = FakeRegistry(sensitive=True)
     agent.tool_registry = registry  # type: ignore[assignment]
+    agent.context_manager = ContextManager(object())
     agent.messages = [{"role": "user", "content": "write a note"}]
     agent.system_prompt = "test"
     agent.max_tool_round = 3
     agent._call_api = lambda messages, system_prompt: next(responses)  # type: ignore[method-assign]
 
-    await agent._tool_call_loop()
+    await agent._agent_loop()
 
     assert registry.approvals == [approved]
     assert agent.messages[2]["role"] == "tool"
