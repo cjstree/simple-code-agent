@@ -190,8 +190,11 @@ class Agent:
                     tools=tool_list,
                     sensitive_tools={"bash", "edit", "write"},
                 )
-                self.system_prompt = f"""Concise coding assistant. cwd: {os.getcwd()}.
-                                         available skill:{self._list_skills()}"""
+                self.system_prompt = (
+                f"Concise coding assistant. cwd: {os.getcwd()}.\n" 
+                f"Skills available:\n{self._list_skills()}\n" 
+                "Use load_skill to get full details when needed."
+                )
                 self.max_tool_round = 5
                 await self._loop()
         finally:
