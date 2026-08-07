@@ -123,7 +123,7 @@ class Agent:
 
     def _scan_skills(self,skills_dir : Path| None = None):
         self.skill_registry = {}
-        if not skills_dir.exists():
+        if skills_dir == None or not skills_dir.exists():
             return
         for d in sorted(skills_dir.iterdir()):
             if not d.is_dir():
@@ -143,6 +143,8 @@ class Agent:
         for func in self.hooks[event]:
             func(kargs)
 
+
+    # Initialize the agent. TODO: move logic to init
     async def start(self):
         if self._owns_telemetry:
             self.telemetry = AgentTelemetry.initialize(
@@ -159,7 +161,7 @@ class Agent:
                 api_key=settings.llm_api_key,
                 base_url=settings.llm_base_url,
             )
-            self._scan_skills()
+            self._scan_skills(skills_dir="./skills")
             self.context_manager = ContextManager(self.client)
             tool_list = [
                 ReadTool(),
@@ -196,6 +198,7 @@ class Agent:
             if self._owns_telemetry:
                 self.telemetry.shutdown()
 
+    # basic io loop, read msg from user input
     async def _loop(self):
         print(
             f"{BOLD}nanocode{RESET} | {DIM}{MODEL} ({'OpenRouter' if OPENROUTER_KEY else 'OpenAI'}) | {os.getcwd()}{RESET}\n"
@@ -224,13 +227,14 @@ class Agent:
                     session_id=self.session_id, prompt=user_input
                 ) as turn_span:
                     self.messages.append({"role": "user", "content": user_input})
-                    await self._tool_call_loop()
+                    await self._agent_loop()
                     if self.messages[-1]["role"] == "assistant":
                         turn_span.set_output(self.messages[-1]["content"])
         except (EOFError, KeyboardInterrupt):
             print(f"\n{DIM}Goodbye!{RESET}")
 
-    async def _tool_call_loop(self):
+    # run agent loop.(Span)
+    async def _agent_loop(self):
         cur_round = 0
         while cur_round < self.max_tool_round:
             # compact tool res before send to llm
@@ -243,7 +247,7 @@ class Agent:
                 print(f"\n{CYAN}⏺{RESET} {render_markdown(resp.content)}")
             # if contain tool_call, call the tools
             if not resp.tool_calls:
-                return
+                break
             for tool_call in resp.tool_calls:
                 tool_name = tool_call.function.name
                 try:
@@ -287,8 +291,13 @@ class Agent:
                 )
             cur_round += 1
             print()
+
+        # stop because achieve max tool call round
         if cur_round == self.max_tool_round:
             print("Maximum tool-call rounds reached.")
+        else :
+            # stop because not more tool calls
+            pass
 
     def _ask_permission(self, tool_name: str) -> bool:
         decision = input(f"{YELLOW}Approve {tool_name} for this call? [y/N] {RESET}")

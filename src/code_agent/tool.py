@@ -240,7 +240,7 @@ class LoadSkillsTool:
     async def run(self, arguments: dict[str, Any]) -> str:
         args = self.arguments_model.model_validate(arguments)
         name = args.skill_name
-        if not args in self.arguments_model:
+        if not name in self.skill_registry:
             return f"error: skill name: {name} not found!"
         else :
             return self.skill_registry[name]['content']

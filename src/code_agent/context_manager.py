@@ -108,7 +108,7 @@ class ContextManager:
                 break
             compacted_content = self._persist_large_output(messages[index])
             messages[index]["content"] = compacted_content
-            remaining_bytes -= size - len(compacted_content)
+            remaining -= size - len(compacted_content)
 
         return messages
 
