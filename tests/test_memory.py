@@ -160,7 +160,7 @@ def test_select_relevant_memories_returns_empty_for_missing_or_invalid_data(
     assert invalid_memory.select_relevant_memories([]) == []
 
 
-# Scenario: extraction considers the latest ten messages and persists new memories.
+# Scenario: extraction considers the latest 30 messages and persists new memories.
 def test_extract_memories_uses_recent_dialogue_and_writes_results(tmp_path) -> None:
     extracted = [
         {
@@ -173,16 +173,16 @@ def test_extract_memories_uses_recent_dialogue_and_writes_results(tmp_path) -> N
     client = FakeClient(json.dumps(extracted))
     memory_dir = tmp_path / "memories"
     memory = Memory(memory_dir, client)  # type: ignore[arg-type]
-    messages = [{"role": "user", "content": f"dialogue-{index}"} for index in range(12)]
+    messages = [{"role": "user", "content": f"dialogue-{index}"} for index in range(32)]
 
     memory.extract_memories(messages)
 
     assert len(client.completions.calls) == 1
     prompt = client.completions.calls[0]["messages"][0]["content"]
-    assert "dialogue-0" not in prompt
-    assert "dialogue-1" not in prompt
+    assert "user: dialogue-0\n" not in prompt
+    assert "user: dialogue-1\n" not in prompt
     assert "dialogue-2" in prompt
-    assert "dialogue-11" in prompt
+    assert "dialogue-31" in prompt
     assert (memory_dir / "python-version.md").read_text(
         encoding="utf-8"
     ) == memory_file(
