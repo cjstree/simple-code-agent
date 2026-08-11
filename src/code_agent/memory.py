@@ -17,6 +17,7 @@ class ExtractedMemory(BaseModel):
 
 
 _EXTRACTED_MEMORIES_ADAPTER = TypeAdapter(list[ExtractedMemory])
+_SELECTED_MEMORIES_ADAPTER = TypeAdapter(list[int])
 
 '''
 When a new agent loop comes, use select_relevant_memories to learn the what the memory needed by the context.
@@ -154,23 +155,84 @@ class Memory :
 
     def _get_catalog(self) -> str:
         catalog_path = self.path / "MEMORY.md"
-        catalog = catalog_path.read_text(encoding='utf-8')
-        if not catalog:
-            return ""
+        catalog = ""
+        try:
+            catalog = catalog_path.read_text(encoding='utf-8')
+        except Exception:  # noqa: BLE001 - invalid responses must not stop shutdown.
+            catalog = ""
+        return catalog
 
     # read the index file MEMORY.md. Ask llm client to choose relevant memories.
     def select_relevant_memories(self,messages, max_items=5) -> list[str]:
-        catalog_path = self.path / "MEMORY.md"
-        catalog = catalog_path.read_text(encoding='utf-8')
-        if not catalog:
+
+        catalog = self._get_catalog()
+        if not catalog.strip():
+            return []
+        # extract user and assistant dialog
+        dialogue_parts = []
+        for msg in messages[-30:]:
+            role = msg.get("role", "?")
+            content = msg.get("content", "")
+            if role in ("assistant","user","system") and isinstance(content, str) and content.strip():
+                dialogue_parts.append(f"{role}: {content}")
+        dialogue = "\n".join(dialogue_parts)
+
+        prompt = (f"Select relevant memory indices. Return JSON array include selected indices.\n\n"
+                    f"Recent conversation:\n{dialogue}\n\nMemory catalog:\n{catalog}")
+        try:
+            completion = self.client.chat.completions.create(
+                model=settings.settings.llm_model_name,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=settings.settings.llm_max_tokens,
+                temperature=settings.settings.llm_temperature,
+            )
+            response_text = completion.choices[0].message.content
+            indices = (
+                _SELECTED_MEMORIES_ADAPTER.validate_json(response_text)
+                if response_text
+                else []
+            )
+        except Exception:  # noqa: BLE001 - invalid responses must not stop shutdown.
+            indices = []
+            
+        #  extract the content of the indices.
+        return self.select_memory_content(indices[:max_items])
+
+    # Read the content of memory, use the index store in MEMORY.md, and find the memory according to file name in MEMORY.md
+    def select_memory_content(self, indices : list[int]) -> list[str]:
+        import re
+
+        if not indices:
             return []
 
+        try:
+            catalog = (self.path / "MEMORY.md").read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            return []
 
-        response = self.client.messages.create(model=MODEL, messages=[{"role": "user",
-            "content": f"Select relevant memory indices. Return JSON array.\n\n"
-                    f"Recent conversation:\n{recent}\n\nMemory catalog:\n{catalog}"}],
-            max_tokens=200)
-        text = extract_text(response.content).strip()
-        indices = json.loads(re.search(r'\[.*?\]', text).group())
-        #  TODO extract the content of the indices.
-        return [files[i]["filename"] for i in indices if 0 <= i < len(files)]
+        # Map each catalog index to the filename in its Markdown link.
+        index_to_filename: dict[int, str] = {}
+        entry_pattern = re.compile(r"^- \[(\d+)\]:\[[^]]*\]\(([^)]+)\)")
+        for line in catalog.splitlines():
+            match = entry_pattern.match(line)
+            if match:
+                index_to_filename[int(match.group(1))] = match.group(2)
+
+        contents: list[str] = []
+        for index in indices:
+            filename = index_to_filename.get(index)
+            if filename is None:
+                continue
+
+            try:
+                text = (self.path / filename).read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                continue
+
+            # The body follows the closing delimiter of the YAML frontmatter.
+            parts = text.split("---", 2)
+            if not text.startswith("---") or len(parts) != 3:
+                continue
+            contents.append(parts[2].strip())
+
+        return contents
