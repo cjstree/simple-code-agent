@@ -22,6 +22,7 @@ _SELECTED_MEMORIES_ADAPTER = TypeAdapter(list[int])
 '''
 When a new agent loop comes, use select_relevant_memories to learn the what the memory needed by the context.
 When agent shundown, call extract_memories.
+TODO: When and how to load memory?
 
 '''
 
@@ -153,7 +154,7 @@ class Memory :
         )
         (self.path / "MEMORY.md").write_text(catalog, encoding="utf-8")
 
-    def _get_catalog(self) -> str:
+    def get_catalog(self) -> str:
         catalog_path = self.path / "MEMORY.md"
         catalog = ""
         try:
@@ -165,7 +166,7 @@ class Memory :
     # read the index file MEMORY.md. Ask llm client to choose relevant memories.
     def select_relevant_memories(self,messages, max_items=5) -> list[str]:
 
-        catalog = self._get_catalog()
+        catalog = self.get_catalog()
         if not catalog.strip():
             return []
         # extract user and assistant dialog
@@ -177,8 +178,10 @@ class Memory :
                 dialogue_parts.append(f"{role}: {content}")
         dialogue = "\n".join(dialogue_parts)
 
-        prompt = (f"Select relevant memory indices. Return JSON array include selected indices.\n\n"
-                    f"Recent conversation:\n{dialogue}\n\nMemory catalog:\n{catalog}")
+        prompt = (f"Select relevant memory indices.\n"
+                  f"Return only a JSON array of catalog indices, such as [0, 2].\n"
+                  f"Return [] when none are relevant.\n\n"
+                  f"Recent conversation:\n{dialogue}\n\nMemory catalog:\n{catalog}")
         try:
             completion = self.client.chat.completions.create(
                 model=settings.settings.llm_model_name,
@@ -194,6 +197,7 @@ class Memory :
             )
         except Exception:  # noqa: BLE001 - invalid responses must not stop shutdown.
             indices = []
+
             
         #  extract the content of the indices.
         return self.select_memory_content(indices[:max_items])
@@ -236,3 +240,7 @@ class Memory :
             contents.append(parts[2].strip())
 
         return contents
+    # TODO : merge old memory files
+    def consolidate_memories():
+        pass
+    

@@ -98,7 +98,7 @@ class ContextManager:
                 break
         return messages
     
-    # save large tool results in disk.
+    # save large tool results in disk. Should called rigth after tool use
     # not the single tool call. If a tool call round contain too much content, compact the most large res until total
     # tool_res < max_tool_round_res. We use len(content) to estimate the token.
     def _tool_res_compact(self,messages:list[dict[str,str]]) -> list[dict[str,str]]:
