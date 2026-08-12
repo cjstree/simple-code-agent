@@ -220,8 +220,10 @@ class Agent:
                 if not user_input:
                     continue
                 if user_input in ("/q", "exit"):
+                    self.memory.extract_memories(self.messages)
                     break
                 if user_input == "/c":
+                    self.memory.extract_memories(self.messages)
                     self.messages = []
                     self.session_id = str(uuid.uuid4())
                     print(f"{GREEN}⏺ Cleared conversation{RESET}")
@@ -244,6 +246,7 @@ class Agent:
                     if self.messages[-1]["role"] == "assistant":
                         turn_span.set_output(self.messages[-1]["content"])
         except (EOFError, KeyboardInterrupt):
+            self.memory.extract_memories(self.messages)
             print(f"\n{DIM}Goodbye!{RESET}")
 
     # run agent loop.(Span)
@@ -309,8 +312,8 @@ class Agent:
         if cur_round == self.max_tool_round:
             print("Maximum tool-call rounds reached.")
         else :
+            pass
             # stop because not more tool calls
-            self.memory.extract_memories(self.messages)
 
     def _ask_permission(self, tool_name: str) -> bool:
         decision = input(f"{YELLOW}Approve {tool_name} for this call? [y/N] {RESET}")
