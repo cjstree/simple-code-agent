@@ -10,6 +10,8 @@ from typing import Any, ClassVar, Literal, Protocol
 
 from pydantic import BaseModel
 
+from code_agent.background_manager import BackgroundManager
+
 _RESET = "\033[0m"
 _DIM = "\033[2m"
 
@@ -191,17 +193,28 @@ def _grep_files(path: str, pattern: re.Pattern[str]) -> list[str]:
 
 class BashArguments(BaseModel):
     cmd: str
+    run_in_background : bool
 
 
 class BashTool:
     type = "function"
     name = "bash"
-    description = "Run shell command"
+    description = "Run shell command. If you can set run_in_background to True, and you will be notified when the command finish."
     parameters: ClassVar[dict[str, Any]] = BashArguments.model_json_schema()
     arguments_model = BashArguments
 
+    bgManager : BackgroundManager
+
+    def __init__(self,bgManager : BackgroundManager | None = None):
+        self.bgManager = bgManager
+        pass
+
     async def run(self, arguments: dict[str, Any]) -> str:
         args = self.arguments_model.model_validate(arguments)
+        if args.run_in_background == True:
+            taskID = self.bgManager.start(args.cmd)
+            return (f"[Background task {taskID} started] "
+                    "The result will be collected on a later turn.")
         process = await asyncio.create_subprocess_shell(
             args.cmd,
             stdout=asyncio.subprocess.PIPE,
