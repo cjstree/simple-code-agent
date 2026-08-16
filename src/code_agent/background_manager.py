@@ -1,6 +1,8 @@
 """Background command scheduling for the local Bash tool."""
 
 import asyncio
+import os
+import signal
 
 
 class BackgroundManager:
@@ -23,6 +25,7 @@ class BackgroundManager:
     terminate_grace_period: float
     _workers: set[asyncio.Task[None]]
     _closed: bool
+    cur : int
 
     def __init__(
         self,
@@ -36,6 +39,10 @@ class BackgroundManager:
         running, finished-result, and worker collections. Task IDs need only be
         unique during the lifetime of one manager.
         """
+        self.max_process = max_process
+        self.time_out = time_out
+        self.terminate_grace_period = terminate_grace_period
+        self.cur = 0
 
     def start(self, cmd: str) -> str:
         """Register ``cmd``, try to schedule work, and return its ID immediately.
@@ -45,6 +52,11 @@ class BackgroundManager:
         the command to start or finish. Calling it after ``close`` raises
         ``RuntimeError``.
         """
+        task_id = f"bg_{self.cur}"
+        self.cur += 1
+        self.ready[task_id] = cmd
+        self._schedule()
+        return task_id
 
     def collect(self) -> list[tuple[str, str]]:
         """Return and consume all finished results in completion order.
@@ -53,6 +65,13 @@ class BackgroundManager:
         drive scheduling. If no command has finished, it returns an empty list
         immediately.
         """
+        ret = [
+            [task_id,res]
+            for task_id,res in  self.finish.items()
+        ]
+        ret.sort(key=lambda x : x[0])
+        self.finish = {}
+        return ret
 
     def _schedule(self) -> None:
         """Fill available process slots from ``ready`` without waiting.
@@ -62,6 +81,16 @@ class BackgroundManager:
         loop. Keep every created task in ``_workers`` until its done callback
         removes it, so fire-and-forget workers retain a strong reference.
         """
+        while len(self.running) < self.max_process and len(self.ready > 0) :
+            task_id = next(iter(self.ready))
+            cmd = self.ready.pop(task_id)
+            worker = asyncio.create_task(
+                self._execute(task_id,cmd)
+            )
+            self.running.add(task_id)
+            self._workers.add(worker)
+            worker.add_done_callback(self._workers.discard(worker))
+            return
 
     async def _execute(self, task_id: str, cmd: str) -> None:
         """Run and supervise one command, then publish its formatted result.
@@ -79,6 +108,41 @@ class BackgroundManager:
         the ID from ``running``; after normal completion call ``_schedule``
         immediately unless the manager is closed.
         """
+
+        res = "(empty)"
+        proc = await asyncio.create_subprocess_shell (
+            cmd=cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session= True,
+        )
+
+        try:
+            stdout,stderr = await asyncio.wait_for(
+                proc.communicate(),
+                timeout=self.time_out
+            )
+            res = self._format_res(
+                output= stdout if proc.returncode == 0 else stderr,
+                returncode=proc.returncode,
+           )
+        except asyncio.TimeoutError:
+            proc.terminate()
+            await asyncio.sleep(self.terminate_grace_period)
+            if proc.returncode is None:
+                os.killpg(proc.pid, signal.SIGTERM)
+                output = "process killed."
+            else :
+                output = "process terminated."
+            res = self._format_res(
+                output=output,
+                timed_out=True
+            )
+        finally:
+            self.running.discard(task_id)
+            self._schedule()
+            self.finish[task_id] = res
+
 
     def _format_res(
         self,
