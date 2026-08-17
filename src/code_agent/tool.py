@@ -199,7 +199,8 @@ class BashArguments(BaseModel):
 class BashTool:
     type = "function"
     name = "bash"
-    description = "Run shell command. If you can set run_in_background to True, and you will be notified when the command finish."
+    description = "Run shell command. If you set run_in_background to True, " \
+    "the result will be collected on a later turn."
     parameters: ClassVar[dict[str, Any]] = BashArguments.model_json_schema()
     arguments_model = BashArguments
 

@@ -43,6 +43,11 @@ class BackgroundManager:
         self.time_out = time_out
         self.terminate_grace_period = terminate_grace_period
         self.cur = 0
+        self.ready = {}
+        self.running = set()
+        self.finish = {}
+        self._workers = set()
+
 
     def start(self, cmd: str) -> str:
         """Register ``cmd``, try to schedule work, and return its ID immediately.
@@ -58,7 +63,7 @@ class BackgroundManager:
         self._schedule()
         return task_id
 
-    def collect(self) -> list[tuple[str, str]]:
+    def collect(self) -> list[list[str]]:
         """Return and consume all finished results in completion order.
 
         Collection never inspects or waits for running processes and does not
@@ -67,9 +72,9 @@ class BackgroundManager:
         """
         ret = [
             [task_id,res]
-            for task_id,res in  self.finish.items()
+            for task_id,res in self.finish.items()
         ]
-        ret.sort(key=lambda x : x[0])
+        
         self.finish = {}
         return ret
 
@@ -81,7 +86,7 @@ class BackgroundManager:
         loop. Keep every created task in ``_workers`` until its done callback
         removes it, so fire-and-forget workers retain a strong reference.
         """
-        while len(self.running) < self.max_process and len(self.ready > 0) :
+        while len(self.running) < self.max_process and len(self.ready) > 0 :
             task_id = next(iter(self.ready))
             cmd = self.ready.pop(task_id)
             worker = asyncio.create_task(
@@ -89,8 +94,8 @@ class BackgroundManager:
             )
             self.running.add(task_id)
             self._workers.add(worker)
-            worker.add_done_callback(self._workers.discard(worker))
-            return
+            worker.add_done_callback(self._workers.discard)
+        return
 
     async def _execute(self, task_id: str, cmd: str) -> None:
         """Run and supervise one command, then publish its formatted result.
@@ -113,30 +118,34 @@ class BackgroundManager:
         proc = await asyncio.create_subprocess_shell (
             cmd=cmd,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
             start_new_session= True,
         )
-
+        commute_task = asyncio.create_task(proc.communicate())
         try:
-            stdout,stderr = await asyncio.wait_for(
-                proc.communicate(),
+            stdout, _ = await asyncio.wait_for(
+                asyncio.shield(commute_task),
                 timeout=self.time_out
             )
+
             res = self._format_res(
-                output= stdout if proc.returncode == 0 else stderr,
+                output= stdout.decode("utf-8", errors="replace"),
                 returncode=proc.returncode,
            )
         except asyncio.TimeoutError:
-            proc.terminate()
-            await asyncio.sleep(self.terminate_grace_period)
-            if proc.returncode is None:
-                os.killpg(proc.pid, signal.SIGTERM)
-                output = "process killed."
-            else :
-                output = "process terminated."
+            os.killpg(proc.pid, signal.SIGTERM)
+            try:
+                stdout, _ = await asyncio.wait_for(
+                    asyncio.shield(commute_task),
+                    timeout=self.terminate_grace_period,
+                )
+            except asyncio.TimeoutError:
+                os.killpg(proc.pid, signal.SIGKILL)
+                stdout, _ = await commute_task
+
             res = self._format_res(
-                output=output,
-                timed_out=True
+                output=stdout.decode("utf-8", errors="replace"),
+                timed_out=True,
             )
         finally:
             self.running.discard(task_id)
@@ -181,3 +190,4 @@ class BackgroundManager:
         process group. The method is idempotent and schedules no replacement
         work while shutdown is in progress.
         """
+        pass
