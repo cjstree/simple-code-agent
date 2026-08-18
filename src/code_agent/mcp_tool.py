@@ -4,14 +4,14 @@ import json
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
-from mcp.client.session import ClientSession
+from code_agent.mcp_client import MCPClient
 
 
 @dataclass(slots=True)
 class MCPTool:
     """Expose one remote MCP tool through the local Tool interface."""
 
-    session: ClientSession
+    client: MCPClient
     name: str
     description: str
     parameters: dict[str, Any]
@@ -19,22 +19,22 @@ class MCPTool:
     type: ClassVar[str] = "function"
 
     @classmethod
-    async def discover(cls, session: ClientSession) -> list["MCPTool"]:
-        """Discover the tools exposed by an initialized MCP session."""
-        response = await session.list_tools()
+    async def discover(cls, client: MCPClient) -> list["MCPTool"]:
+        """Discover the tools exposed by an initialized MCP client."""
+        tools = await client.list_tools()
         return [
             cls(
-                session=session,
+                client=client,
                 name=tool.name,
                 description=tool.description or "",
                 parameters=tool.input_schema,
             )
-            for tool in response.tools
+            for tool in tools
         ]
 
     async def run(self, arguments: dict[str, Any]) -> str:
         """Call this tool on its MCP server and return a textual result."""
-        result = await self.session.call_tool(
+        result = await self.client.call_tool(
             name=self.name,
             arguments=arguments,
         )

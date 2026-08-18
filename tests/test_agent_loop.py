@@ -73,7 +73,8 @@ async def test_agent_exits_cleanly_on_terminal_signal(
     monkeypatch.setattr("code_agent.agent.separator", lambda: "---")
     monkeypatch.setattr("builtins.input", raise_exit_error)
 
-    agent = Agent()
+    agent = Agent(telemetry=AgentTelemetry())
+    agent.memory = SimpleNamespace(extract_memories=lambda messages: None)
     await agent._loop()
 
     assert "Goodbye!" in capsys.readouterr().out
@@ -96,7 +97,7 @@ async def test_agent_completes_one_tool_call_cycle() -> None:
         ]
     )
 
-    agent = Agent()
+    agent = Agent(telemetry=AgentTelemetry())
     registry = FakeRegistry()
     agent.tool_registry = registry  # type: ignore[assignment]
     agent.context_manager = ContextManager(object())
@@ -143,7 +144,7 @@ async def test_agent_passes_sensitive_tool_decision_to_registry(
     )
     monkeypatch.setattr("builtins.input", lambda prompt: decision)
 
-    agent = Agent()
+    agent = Agent(telemetry=AgentTelemetry())
     registry = FakeRegistry(sensitive=True)
     agent.tool_registry = registry  # type: ignore[assignment]
     agent.context_manager = ContextManager(object())

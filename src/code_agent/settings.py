@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     llm_temperature: float = 0.2
     llm_max_tokens: int = 1024
     mcp_url: str | None = None
+    mcp_connect_timeout: float = 3.0
     phoenix_enabled: bool = False
     phoenix_collector_endpoint: str = "http://localhost:6006/v1/traces"
     phoenix_project_name: str = "code-agent-dev"

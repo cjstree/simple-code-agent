@@ -1,6 +1,7 @@
 import pytest
 
 from code_agent.agent import Agent, _parse_frontmatter
+from code_agent.telemetry import AgentTelemetry
 from code_agent.tool import LoadSkillsTool
 
 
@@ -41,7 +42,7 @@ def test_scan_skills_registers_manifests_from_explicit_directory(tmp_path) -> No
     (beta / "SKILL.md").write_text(beta_manifest, encoding="utf-8")
     (tmp_path / "not-a-skill.md").write_text("ignored", encoding="utf-8")
 
-    agent = Agent()
+    agent = Agent(telemetry=AgentTelemetry())
     agent._scan_skills(tmp_path)
 
     assert agent.skill_registry == {
@@ -60,7 +61,7 @@ def test_scan_skills_registers_manifests_from_explicit_directory(tmp_path) -> No
 
 # Scenario: starting without a configured skills directory yields an empty registry.
 def test_scan_skills_accepts_no_configured_directory() -> None:
-    agent = Agent()
+    agent = Agent(telemetry=AgentTelemetry())
 
     agent._scan_skills(None)
 

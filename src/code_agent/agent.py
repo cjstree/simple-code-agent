@@ -2,16 +2,16 @@
 
 import json
 import os
-from pathlib import Path
 import re
 import uuid
-from contextlib import AsyncExitStack
+from pathlib import Path
 from typing import Any
 
-from mcp.client.session import ClientSession
-from mcp.client.streamable_http import streamable_http_client
+import yaml
 from openai import OpenAI
 
+from code_agent.context_manager import ContextManager
+from code_agent.mcp_client import MCPClient
 from code_agent.mcp_tool import MCPTool
 from code_agent.memory import Memory
 from code_agent.settings import settings
@@ -24,12 +24,10 @@ from code_agent.tool import (
     LoadSkillsTool,
     ReadTool,
     TodoWriteTool,
+    Tool,
     WriteTool,
 )
 from code_agent.tool_registry import ToolRegistry
-from code_agent.context_manager import ContextManager
-
-import yaml
 
 OPENROUTER_KEY = None
 MODEL = settings.llm_model_name
@@ -110,9 +108,8 @@ class Agent:
     skill_registry : dict[str,dict]
     memory : Memory
 
-    def __init__(self, telemetry: AgentTelemetry | None = None):
-        self.telemetry = telemetry or AgentTelemetry()
-        self._owns_telemetry = telemetry is None
+    def __init__(self, telemetry: AgentTelemetry):
+        self.telemetry = telemetry
         self.session_id = str(uuid.uuid4())
         self.hooks = {
             "UsrPromptSubmit": [],
@@ -146,64 +143,49 @@ class Agent:
             func(kargs)
 
 
-    # Initialize the agent. TODO: move logic to init
+    def _create_local_tools(self) -> list[Tool]:
+        return [
+            ReadTool(),
+            BashTool(),
+            EditTool(),
+            GlobTool(),
+            GrepTool(),
+            WriteTool(),
+            TodoWriteTool(),
+            LoadSkillsTool(self.skill_registry),
+        ]
+
     async def start(self):
-        if self._owns_telemetry:
-            self.telemetry = AgentTelemetry.initialize(
-                enabled=settings.phoenix_enabled,
-                endpoint=settings.phoenix_collector_endpoint,
-                project_name=settings.phoenix_project_name,
+        if not settings.llm_api_key or not settings.llm_model_name:
+            raise RuntimeError(
+                "LLM_API_KEY and LLM_MODEL_NAME must be configured in agent/.env"
             )
-        try:
-            if not settings.llm_api_key or not settings.llm_model_name:
-                raise RuntimeError(
-                    "LLM_API_KEY and LLM_MODEL_NAME must be configured in agent/.env"
-                )
 
-            self.client = OpenAI(
-                api_key=settings.llm_api_key,
-                base_url=settings.llm_base_url,
+        self.client = OpenAI(
+            api_key=settings.llm_api_key,
+            base_url=settings.llm_base_url,
+        )
+        self._scan_skills(skills_dir = Path("./skills"))
+        self.context_manager = ContextManager(self.client)
+        self.memory = Memory(path = Path("./memory"),client = self.client)
+        tool_list = self._create_local_tools()
+        async with MCPClient(
+            url=settings.mcp_url,
+            connect_timeout=settings.mcp_connect_timeout,
+        ) as mcp_client:
+            tool_list.extend(await MCPTool.discover(mcp_client))
+
+            self.tool_registry = ToolRegistry(
+                tools=tool_list,
+                sensitive_tools={"bash", "edit", "write"},
             )
-            self._scan_skills(skills_dir = Path("./skills"))
-            self.context_manager = ContextManager(self.client)
-            self.memory = Memory(path = Path("./memory"),client = self.client)
-            tool_list = [
-                ReadTool(),
-                BashTool(),
-                EditTool(),
-                GlobTool(),
-                GrepTool(),
-                WriteTool(),
-                TodoWriteTool(),
-                LoadSkillsTool(self.skill_registry),
-            ]
-            async with AsyncExitStack() as stack:
-                if settings.mcp_url:
-                    read_stream, write_stream = await stack.enter_async_context(
-                        streamable_http_client(settings.mcp_url)
-                    )
-                    session = await stack.enter_async_context(
-                        ClientSession(read_stream, write_stream)
-                    )
-                    server_info = await session.initialize()
-                    print(f"Connected MCP server: {server_info.server_info}")
-                    mcp_tools = await MCPTool.discover(session=session)
-                    tool_list.extend(mcp_tools)
-
-                self.tool_registry = ToolRegistry(
-                    tools=tool_list,
-                    sensitive_tools={"bash", "edit", "write"},
-                )
-                self.system_prompt = (
+            self.system_prompt = (
                 f"Concise coding assistant. cwd: {os.getcwd()}.\n" 
                 f"Skills available:\n{self._list_skills()}\n" 
                 "Use load_skill to get full details when needed."
-                )
-                self.max_tool_round = 5
-                await self._loop()
-        finally:
-            if self._owns_telemetry:
-                self.telemetry.shutdown()
+            )
+            self.max_tool_round = 5
+            await self._loop()
 
     # basic io loop, read msg from user input
     async def _loop(self):

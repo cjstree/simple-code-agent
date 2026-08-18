@@ -183,11 +183,4 @@ class BackgroundManager:
         return f"{status}\n{rendered_output}"
 
     async def close(self) -> None:
-        """Stop all work and release subprocess resources.
-
-        Mark the manager closed, discard queued and finished entries, cancel and
-        await all workers, and rely on each worker to terminate and reap its own
-        process group. The method is idempotent and schedules no replacement
-        work while shutdown is in progress.
-        """
         pass
