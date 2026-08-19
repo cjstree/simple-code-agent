@@ -10,6 +10,7 @@ from typing import Any
 import yaml
 from openai import OpenAI
 
+from code_agent.background_manager import BackgroundManager
 from code_agent.context_manager import ContextManager
 from code_agent.mcp_client import MCPClient
 from code_agent.mcp_tool import MCPTool
@@ -106,17 +107,20 @@ class Agent:
     hooks: dict[str, list[callable]]
     context_manager : ContextManager
     skill_registry : dict[str,dict]
+    bgManager: BackgroundManager
     memory : Memory
 
     def __init__(self, telemetry: AgentTelemetry):
         self.telemetry = telemetry
         self.session_id = str(uuid.uuid4())
         self.hooks = {
-            "UsrPromptSubmit": [],
-            "PreToolUse": [],
-            "PostToolUse": [],
-            "Stop": [],
+            "UsrPromptSubmit": [], # after userinput, before llm submit.
+            "PreLLMSubmit":[], # right before llm submit.
+            "PreToolUse": [], # Before every tool use.
+            "PostToolUse": [], # After tool use round.
+            "Stop": [], # a turn stop. Before next turn begin.
         }
+        self.bgManager = BackgroundManager()
     def _list_skills(self) -> str:
         return "\n".join(f"- **{s['name']}**: {s['description']}" for s in self.skill_registry.values())
 
@@ -140,13 +144,16 @@ class Agent:
 
     def triggerHook(self, event: str, **kargs):
         for func in self.hooks[event]:
-            func(kargs)
+            ret = func(**kargs)
+            # if has return, means something wrong. Like permission deny
+            if ret:
+                return ret
 
 
     def _create_local_tools(self) -> list[Tool]:
         return [
             ReadTool(),
-            BashTool(),
+            BashTool(self.bgManager),
             EditTool(),
             GlobTool(),
             GrepTool(),
@@ -154,6 +161,36 @@ class Agent:
             TodoWriteTool(),
             LoadSkillsTool(self.skill_registry),
         ]
+
+    def compact(self) -> None :
+        if len(self.messages) > 4 and self.context_manager:
+            self.messages = self.context_manager.compact(self.messages)
+
+    def collect_bg_result(self) -> None:
+        if self.bgManager:
+            res = self.bgManager.collect()
+            if res:
+                lines = [
+                    f"taskid:{id}  result:{result}"
+                    for [id,result] in res
+                ]
+                header = f"collect {len(res)} background task result."
+                content =  f"{header}\n" + "\n".join(lines)
+                self.messages.append({"role":"user","content":content})
+
+    def check_tool_permission(self,tool_name):
+        if self.tool_registry.requires_approval(tool_name):
+            approved = self._ask_permission(tool_name)
+            if approved == False:
+                return False
+    def compact_tool_res(self):
+        if self.context_manager:
+            self.messages =  self.context_manager._tool_res_compact(self.messages)
+    # TODO: add extract frequency control
+    def extract_memory(self):
+        if self.memory:
+            #self.memory.extract_memories(self.messages) 
+            pass
 
     async def start(self):
         if not settings.llm_api_key or not settings.llm_model_name:
@@ -169,6 +206,16 @@ class Agent:
         self.context_manager = ContextManager(self.client)
         self.memory = Memory(path = Path("./memory"),client = self.client)
         tool_list = self._create_local_tools()
+        # regist hooks
+
+        self.registHook(event="UsrPromptSubmit",func = self.build_system)
+        self.registHook(event="UsrPromptSubmit",func = self.compact)
+        self.registHook(event="PreLLMSubmit",func = self.collect_bg_result)
+        self.registHook(event="PreToolUse",func = self.check_tool_permission)
+        self.registHook(event="PostToolUse",func = self.compact_tool_res)
+        self.registHook(event="Stop",func = self.extract_memory)
+
+        #
         async with MCPClient(
             url=settings.mcp_url,
             connect_timeout=settings.mcp_connect_timeout,
@@ -202,41 +249,34 @@ class Agent:
                 if not user_input:
                     continue
                 if user_input in ("/q", "exit"):
-                    self.memory.extract_memories(self.messages)
                     break
                 if user_input == "/c":
-                    self.memory.extract_memories(self.messages)
                     self.messages = []
                     self.session_id = str(uuid.uuid4())
                     print(f"{GREEN}⏺ Cleared conversation{RESET}")
                     continue
 
-                # compact message
-                self.messages = self.context_manager.compact(self.messages)
-                # start a new span
+                # start a new span/turn
                 with self.telemetry.trace_turn(
                     session_id=self.session_id, prompt=user_input
                 ) as turn_span:
                     self.messages.append({"role": "user", "content": user_input})
-
-                    # select and load memory
-                    relevant =  self.memory.select_relevant_memories(self.messages)
-                    sys_prompt = self.build_system(relevant)
                     
+                    self.triggerHook("UsrPromptSubmit")
 
-                    await self._agent_loop(system_prompt=sys_prompt)
+                    await self._agent_loop()
                     if self.messages[-1]["role"] == "assistant":
                         turn_span.set_output(self.messages[-1]["content"])
         except (EOFError, KeyboardInterrupt):
-            self.memory.extract_memories(self.messages)
             print(f"\n{DIM}Goodbye!{RESET}")
 
     # run agent loop.(Span)
-    async def _agent_loop(self,system_prompt : str | None = None):
+    async def _agent_loop(self):
         cur_round = 0
         while cur_round < self.max_tool_round:
+            self.triggerHook("PreLLMSubmit")
             # call the llm.
-            resp = self._call_api(self.messages, system_prompt if system_prompt else self.system_prompt)
+            resp = self._call_api(self.messages)
             self.messages.append(rsp2msg(resp))
             # print response content
             if resp.content:
@@ -258,10 +298,10 @@ class Agent:
                             f"\n{GREEN}⏺ {tool_name.capitalize()}{RESET}"
                             f"({DIM}{argument_text}{RESET})"
                         )
-                        # check permission
                         approved = True
-                        if self.tool_registry.requires_approval(tool_name):
-                            approved = self._ask_permission(tool_name)
+                        ret =self.triggerHook("PreToolUse")
+                        if ret:
+                            approved = False
                         # run the tool
                         res = await self.tool_registry.run_tool(
                             tool_name=tool_name,
@@ -287,9 +327,11 @@ class Agent:
                 )
             cur_round += 1
             # compact tool res before send to llm
+            self.triggerHook("PostToolUse")
             self.messages =  self.context_manager._tool_res_compact(self.messages)
             print()
 
+        self.triggerHook("Stop")
         # stop because achieve max tool call round
         if cur_round == self.max_tool_round:
             print("Maximum tool-call rounds reached.")
@@ -313,8 +355,8 @@ class Agent:
             preview += "..."
         print(f"  {DIM}⎿  {preview}{RESET}")
 
-    def _call_api(self, messages: list, system_prompt: str):
-        openai_messages = [{"role": "system", "content": system_prompt}, *messages]
+    def _call_api(self, messages: list):
+        openai_messages = messages
         completion = self.client.chat.completions.create(
             model=settings.llm_model_name,
             messages=openai_messages,
@@ -324,7 +366,10 @@ class Agent:
         )
         return completion.choices[0].message
 
-    def build_system(self, relevant_memories: list[str] | None = None) -> str:
+    def build_system(self) -> None:
+        relevant = ""
+        if self.memory:
+            relevant =  self.memory.select_relevant_memories(self.messages)
 
         sections = [
             (
@@ -341,9 +386,10 @@ class Agent:
             ),
         ]
 
-        if relevant_memories:
+        if relevant:
             memory_records = "\n\n".join(
-                f"<memory>\n{memory}\n</memory>" for memory in relevant_memories
+                f"<memory>\n{memory}\n</memory>" for memory in relevant
             )
             sections.append(f"Relevant memory records:\n{memory_records}")
-        return "\n\n".join(sections)
+        sys_prompt = "\n\n".join(sections)
+        self.messages.insert(0,{"role": "system", "content": sys_prompt})
