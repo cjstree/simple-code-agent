@@ -21,12 +21,28 @@ class AgentSpan:
     def __init__(self, span: Any | None = None) -> None:
         self._span = span
 
-    def set_output(self, output: str | None) -> None:
+    def set_output(self, output: Any | None) -> None:
         """Attach an unredacted textual result to the current span."""
         if self._span is None or output is None:
             return
-        self._span.set_attribute(_OUTPUT_VALUE, output)
-        self._span.set_attribute(_OUTPUT_MIME_TYPE, "text/plain")
+        if isinstance(output, str):
+            output_value = output
+            output_mime_type = "text/plain"
+        else:
+            output_value = json.dumps(output, ensure_ascii=False, default=str)
+            output_mime_type = "application/json"
+        self._span.set_attribute(_OUTPUT_VALUE, output_value)
+        self._span.set_attribute(_OUTPUT_MIME_TYPE, output_mime_type)
+
+    def set_attribute(self, key: str, value: Any) -> None:
+        """Attach an operation-specific attribute to the current span."""
+        if self._span is not None:
+            self._span.set_attribute(key, value)
+
+    def record_exception(self, error: Exception) -> None:
+        """Record a handled exception without changing application behavior."""
+        if self._span is not None:
+            self._span.record_exception(error)
 
 
 class AgentTelemetry:
@@ -141,6 +157,37 @@ class AgentTelemetry:
         }
         with self._tracer.start_as_current_span(
             f"tool.{tool_name}", attributes=attributes
+        ) as span:
+            yield AgentSpan(span)
+
+    @contextmanager
+    def trace_operation(
+        self,
+        *,
+        name: str,
+        span_kind: str,
+        input_value: Any,
+    ):
+        """Trace one agent subsystem operation as a child of the current span."""
+        if self._tracer is None:
+            yield AgentSpan()
+            return
+
+        if isinstance(input_value, str):
+            serialized_input = input_value
+            input_mime_type = "text/plain"
+        else:
+            serialized_input = json.dumps(
+                input_value, ensure_ascii=False, default=str
+            )
+            input_mime_type = "application/json"
+        attributes = {
+            _SPAN_KIND: span_kind,
+            _INPUT_VALUE: serialized_input,
+            _INPUT_MIME_TYPE: input_mime_type,
+        }
+        with self._tracer.start_as_current_span(
+            name, attributes=attributes
         ) as span:
             yield AgentSpan(span)
 

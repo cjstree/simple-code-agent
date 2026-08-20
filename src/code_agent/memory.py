@@ -5,6 +5,7 @@ from openai import AsyncOpenAI
 from pydantic import BaseModel, TypeAdapter
 
 from code_agent import settings
+from code_agent.telemetry import AgentTelemetry
 
 
 class ExtractedMemory(BaseModel):
@@ -51,63 +52,80 @@ class Memory :
 
     path : Path
     client : AsyncOpenAI
-    def __init__(self,path : Path,client : AsyncOpenAI) :
+    def __init__(
+        self,
+        path: Path,
+        client: AsyncOpenAI,
+        telemetry: AgentTelemetry | None = None,
+    ):
         self.path = path
         self.client = client
+        self.telemetry = telemetry if telemetry is not None else AgentTelemetry()
 
     # extract memory from current messages.
     async def extract_memories(self,messages: list[dict[str,str]]) -> None:
-        # extract dialogue from messages. Save token use.
-        # use this format can save more token than using json.
-        dialogue_parts = []
-        for msg in messages[-30:]:
-            role = msg.get("role", "?")
-            content = msg.get("content", "")
-            if isinstance(content, str) and content.strip():
-                dialogue_parts.append(f"{role}: {content}")
-        dialogue = "\n".join(dialogue_parts)
+        with self.telemetry.trace_operation(
+            name="memory.extract",
+            span_kind="chain",
+            input_value=messages,
+        ) as span:
+            # extract dialogue from messages. Save token use.
+            # use this format can save more token than using json.
+            dialogue_parts = []
+            for msg in messages[-30:]:
+                role = msg.get("role", "?")
+                content = msg.get("content", "")
+                if isinstance(content, str) and content.strip():
+                    dialogue_parts.append(f"{role}: {content}")
+            dialogue = "\n".join(dialogue_parts)
 
-        catalog_path = self.path / "MEMORY.md"
-        try:
-            catalog = (
-                catalog_path.read_text(encoding="utf-8")
-                if catalog_path.exists()
-                else ""
-            )
-        except (OSError, UnicodeError):
-            catalog = ""
+            catalog_path = self.path / "MEMORY.md"
+            try:
+                catalog = (
+                    catalog_path.read_text(encoding="utf-8")
+                    if catalog_path.exists()
+                    else ""
+                )
+            except (OSError, UnicodeError):
+                catalog = ""
 
-        prompt = (
-            "Extract user preferences, constraints, or project facts.\n"
-            "Return JSON array: [{name, type, description, body}].\n"
-            "If nothing new or already covered, return [].\n\n"
-            f"Existing memories:\n{catalog}\n\nDialogue:\n{dialogue[:4000]}"
-        )
+            prompt = (
+                "Extract user preferences, constraints, or project facts.\n"
+                "Return JSON array: [{name, type, description, body}].\n"
+                "If nothing new or already covered, return [].\n\n"
+                f"Existing memories:\n{catalog}\n\nDialogue:\n{dialogue[:4000]}"
+            )
 
-        try:
-            completion = await self.client.chat.completions.create(
-                model=settings.settings.llm_model_name,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=settings.settings.llm_max_tokens,
-                temperature=settings.settings.llm_temperature,
-            )
-            response_text = completion.choices[0].message.content
-            memories = (
-                _EXTRACTED_MEMORIES_ADAPTER.validate_json(response_text)
-                if response_text
-                else []
-            )
-        except Exception:  # noqa: BLE001 - invalid responses must not stop shutdown.
-            return
+            try:
+                completion = await self.client.chat.completions.create(
+                    model=settings.settings.llm_model_name,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=settings.settings.llm_max_tokens,
+                    temperature=settings.settings.llm_temperature,
+                )
+                response_text = completion.choices[0].message.content
+                memories = (
+                    _EXTRACTED_MEMORIES_ADAPTER.validate_json(response_text)
+                    if response_text
+                    else []
+                )
+            except Exception as error:  # noqa: BLE001 - preserve existing behavior.
+                span.record_exception(error)
+                span.set_attribute("memory.status", "error")
+                span.set_output([])
+                return
 
-        for memory in memories:
-            # write_memory_file also refreshes MEMORY.md after each new memory.
-            self.write_memory_file(
-                memory.name,
-                memory.type,
-                memory.description,
-                memory.body,
-            )
+            for memory in memories:
+                # write_memory_file also refreshes MEMORY.md after each new memory.
+                self.write_memory_file(
+                    memory.name,
+                    memory.type,
+                    memory.description,
+                    memory.body,
+                )
+            span.set_attribute("memory.extracted.count", len(memories))
+            span.set_attribute("memory.status", "completed")
+            span.set_output([memory.model_dump() for memory in memories])
 
 
     
@@ -165,42 +183,55 @@ class Memory :
 
     # read the index file MEMORY.md. Ask llm client to choose relevant memories.
     async def select_relevant_memories(self,messages, max_items=5) -> list[str]:
+        with self.telemetry.trace_operation(
+            name="memory.select_relevant",
+            span_kind="retriever",
+            input_value={"messages": messages, "max_items": max_items},
+        ) as span:
+            catalog = self.get_catalog()
+            if not catalog.strip():
+                span.set_attribute("memory.status", "empty_catalog")
+                span.set_output([])
+                return []
+            # extract user and assistant dialog
+            dialogue_parts = []
+            for msg in messages[-30:]:
+                role = msg.get("role", "?")
+                content = msg.get("content", "")
+                if role in ("assistant","user","system") and isinstance(content, str) and content.strip():
+                    dialogue_parts.append(f"{role}: {content}")
+            dialogue = "\n".join(dialogue_parts)
 
-        catalog = self.get_catalog()
-        if not catalog.strip():
-            return []
-        # extract user and assistant dialog
-        dialogue_parts = []
-        for msg in messages[-30:]:
-            role = msg.get("role", "?")
-            content = msg.get("content", "")
-            if role in ("assistant","user","system") and isinstance(content, str) and content.strip():
-                dialogue_parts.append(f"{role}: {content}")
-        dialogue = "\n".join(dialogue_parts)
+            prompt = (f"Select relevant memory indices.\n"
+                      f"Return only a JSON array of catalog indices, such as [0, 2].\n"
+                      f"Return [] when none are relevant.\n\n"
+                      f"Recent conversation:\n{dialogue}\n\nMemory catalog:\n{catalog}")
+            try:
+                completion = await self.client.chat.completions.create(
+                    model=settings.settings.llm_model_name,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=settings.settings.llm_max_tokens,
+                    temperature=settings.settings.llm_temperature,
+                )
+                response_text = completion.choices[0].message.content
+                indices = (
+                    _SELECTED_MEMORIES_ADAPTER.validate_json(response_text)
+                    if response_text
+                    else []
+                )
+                status = "selected" if indices else "empty_selection"
+            except Exception as error:  # noqa: BLE001 - preserve existing behavior.
+                span.record_exception(error)
+                status = "error"
+                indices = []
 
-        prompt = (f"Select relevant memory indices.\n"
-                  f"Return only a JSON array of catalog indices, such as [0, 2].\n"
-                  f"Return [] when none are relevant.\n\n"
-                  f"Recent conversation:\n{dialogue}\n\nMemory catalog:\n{catalog}")
-        try:
-            completion = await self.client.chat.completions.create(
-                model=settings.settings.llm_model_name,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=settings.settings.llm_max_tokens,
-                temperature=settings.settings.llm_temperature,
-            )
-            response_text = completion.choices[0].message.content
-            indices = (
-                _SELECTED_MEMORIES_ADAPTER.validate_json(response_text)
-                if response_text
-                else []
-            )
-        except Exception:  # noqa: BLE001 - invalid responses must not stop shutdown.
-            indices = []
 
-            
-        #  extract the content of the indices.
-        return self.select_memory_content(indices[:max_items])
+            #  extract the content of the indices.
+            selected = self.select_memory_content(indices[:max_items])
+            span.set_attribute("memory.selected.count", len(selected))
+            span.set_attribute("memory.status", status)
+            span.set_output(selected)
+            return selected
 
     # Read the content of memory, use the index store in MEMORY.md, and find the memory according to file name in MEMORY.md
     def select_memory_content(self, indices : list[int]) -> list[str]:

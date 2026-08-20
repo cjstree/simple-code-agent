@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Self
 
 import pytest
 
@@ -60,23 +60,92 @@ async def test_agent_starts_with_local_tools_and_no_mcp(
     monkeypatch.setattr(settings, "mcp_url", None)
     agent = Agent(telemetry=AgentTelemetry())
 
-    async def stop_before_interactive_loop() -> None:
-        return None
+    try:
+        await agent.start()
 
-    monkeypatch.setattr(agent, "_loop", stop_before_interactive_loop)
+        assert set(agent.tool_registry.tools) == {
+            "bash",
+            "edit",
+            "glob",
+            "grep",
+            "load_skills",
+            "read",
+            "todo_write",
+            "write",
+        }
+    finally:
+        await agent.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_run_can_be_called_without_cli_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "llm_api_key", "test-key")
+    monkeypatch.setattr(settings, "llm_model_name", "test-model")
+    monkeypatch.setattr(settings, "mcp_url", None)
+    agent = Agent(telemetry=AgentTelemetry(), system_prompt="test system")
+    loop_calls = 0
+
+    async def fake_agent_loop() -> None:
+        nonlocal loop_calls
+        loop_calls += 1
+
+    try:
+        await agent.start()
+        monkeypatch.setattr(agent, "_agent_loop", fake_agent_loop)
+
+        result = await agent.run("hello")
+
+        assert result is None
+        assert loop_calls == 1
+        assert agent.messages == [
+            {"role": "system", "content": "test system"},
+            {"role": "user", "content": "hello"},
+        ]
+    finally:
+        await agent.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_keeps_mcp_open_until_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "llm_api_key", "test-key")
+    monkeypatch.setattr(settings, "llm_model_name", "test-model")
+    monkeypatch.setattr(settings, "mcp_url", "https://mcp.example.test")
+
+    class FakeMCPClient:
+        def __init__(self, *, url: str | None, connect_timeout: float) -> None:
+            self.url = url
+            self.connect_timeout = connect_timeout
+            self.entered = False
+            self.exited = False
+
+        async def __aenter__(self) -> Self:
+            self.entered = True
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback) -> None:
+            self.exited = True
+
+        async def list_tools(self) -> list[Any]:
+            return []
+
+    monkeypatch.setattr("code_agent.agent.MCPClient", FakeMCPClient)
+    agent = Agent(telemetry=AgentTelemetry())
 
     await agent.start()
+    mcp_client = agent.mcp_client
 
-    assert set(agent.tool_registry.tools) == {
-        "bash",
-        "edit",
-        "glob",
-        "grep",
-        "load_skills",
-        "read",
-        "todo_write",
-        "write",
-    }
+    assert isinstance(mcp_client, FakeMCPClient)
+    assert mcp_client.entered is True
+    assert mcp_client.exited is False
+
+    await agent.close()
+
+    assert mcp_client.exited is True
+    assert agent.mcp_client is None
 
 
 @pytest.mark.asyncio
@@ -94,7 +163,7 @@ async def test_agent_exits_cleanly_on_terminal_signal(
 
     agent = Agent(telemetry=AgentTelemetry())
     agent.memory = SimpleNamespace(extract_memories=lambda messages: None)
-    await agent._loop()
+    await agent.cli_loop()
 
     assert "Goodbye!" in capsys.readouterr().out
 

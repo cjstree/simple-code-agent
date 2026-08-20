@@ -7,9 +7,13 @@ from code_agent.telemetry import AgentTelemetry
 class FakeSpan:
     def __init__(self) -> None:
         self.attributes: dict[str, Any] = {}
+        self.exceptions: list[Exception] = []
 
     def set_attribute(self, key: str, value: Any) -> None:
         self.attributes[key] = value
+
+    def record_exception(self, error: Exception) -> None:
+        self.exceptions.append(error)
 
 
 class FakeTracer:
@@ -74,6 +78,35 @@ def test_tool_span_records_raw_arguments_and_result() -> None:
     assert attributes["tool.call.id"] == "call-1"
     assert attributes["input.value"] == '{"query":"原始问题"}'
     assert recorded_span.attributes["output.value"] == '{"matches":["完整结果"]}'
+
+
+def test_operation_span_records_structured_input_output_and_attributes() -> None:
+    tracer = FakeTracer()
+    telemetry = AgentTelemetry(tracer=tracer)
+    error = ValueError("invalid response")
+
+    with telemetry.trace_operation(
+        name="memory.select_relevant",
+        span_kind="retriever",
+        input_value={"query": "完整问题"},
+    ) as span:
+        span.set_attribute("memory.selected.count", 1)
+        span.record_exception(error)
+        span.set_output(["完整记忆"])
+
+    name, attributes, recorded_span = tracer.started[0]
+    assert name == "memory.select_relevant"
+    assert attributes == {
+        "openinference.span.kind": "retriever",
+        "input.value": '{"query": "完整问题"}',
+        "input.mime_type": "application/json",
+    }
+    assert recorded_span.attributes == {
+        "memory.selected.count": 1,
+        "output.value": '["完整记忆"]',
+        "output.mime_type": "application/json",
+    }
+    assert recorded_span.exceptions == [error]
 
 
 def test_disabled_telemetry_is_a_noop() -> None:

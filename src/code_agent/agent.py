@@ -5,6 +5,7 @@ import json
 import os
 import re
 import uuid
+from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any
 
@@ -112,7 +113,7 @@ class Agent:
     bgManager: BackgroundManager
     memory : Memory
 
-    def __init__(self, telemetry: AgentTelemetry):
+    def __init__(self, telemetry: AgentTelemetry,system_prompt : str | None = None):
         self.telemetry = telemetry
         self.session_id = str(uuid.uuid4())
         self.hooks = {
@@ -123,6 +124,10 @@ class Agent:
             "Stop": [], # a turn stop. Before next turn begin.
         }
         self.bgManager = BackgroundManager()
+        self.system_prompt = system_prompt
+        self.messages = [{}]
+        self._exit_stack: AsyncExitStack | None = None
+        self.mcp_client: MCPClient | None = None
     def _list_skills(self) -> str:
         return "\n".join(f"- **{s['name']}**: {s['description']}" for s in self.skill_registry.values())
 
@@ -207,8 +212,12 @@ class Agent:
             base_url=settings.llm_base_url,
         )
         self._scan_skills(skills_dir = Path("./skills"))
-        self.context_manager = ContextManager(self.client)
-        self.memory = Memory(path = Path("./memory"),client = self.client)
+        self.context_manager = ContextManager(self.client, telemetry=self.telemetry)
+        self.memory = Memory(
+            path=Path("./memory"),
+            client=self.client,
+            telemetry=self.telemetry,
+        )
         tool_list = self._create_local_tools()
         # regist hooks
 
@@ -219,31 +228,40 @@ class Agent:
         self.registHook(event="PostToolUse",func = self.compact_tool_res)
         self.registHook(event="Stop",func = self.extract_memory)
 
-        #
-        async with MCPClient(
-            url=settings.mcp_url,
-            connect_timeout=settings.mcp_connect_timeout,
-        ) as mcp_client:
+        exit_stack = AsyncExitStack()
+        try:
+            mcp_client = await exit_stack.enter_async_context(
+                MCPClient(
+                    url=settings.mcp_url,
+                    connect_timeout=settings.mcp_connect_timeout,
+                )
+            )
             tool_list.extend(await MCPTool.discover(mcp_client))
 
             self.tool_registry = ToolRegistry(
                 tools=tool_list,
                 sensitive_tools={"bash", "edit", "write"},
             )
-            self.system_prompt = (
-                f"Concise coding assistant. cwd: {os.getcwd()}.\n" 
-                f"Skills available:\n{self._list_skills()}\n" 
-                "Use load_skill to get full details when needed."
-            )
             self.max_tool_round = 5
-            await self._loop()
+        except BaseException:
+            await exit_stack.aclose()
+            raise
+
+        self._exit_stack = exit_stack
+        self.mcp_client = mcp_client
+
+    async def close(self) -> None:
+        exit_stack = self._exit_stack
+        self._exit_stack = None
+        self.mcp_client = None
+        if exit_stack is not None:
+            await exit_stack.aclose()
 
     # basic io loop, read msg from user input
-    async def _loop(self):
+    async def cli_loop(self):
         print(
             f"{BOLD}nanocode{RESET} | {DIM}{MODEL} ({'OpenRouter' if OPENROUTER_KEY else 'OpenAI'}) | {os.getcwd()}{RESET}\n"
         )
-        self.messages = []
         try:
             while True:
                 print(separator())
@@ -255,24 +273,24 @@ class Agent:
                 if user_input in ("/q", "exit"):
                     break
                 if user_input == "/c":
-                    self.messages = []
+                    self.messages = [{}]
                     self.session_id = str(uuid.uuid4())
                     print(f"{GREEN}⏺ Cleared conversation{RESET}")
                     continue
 
                 # start a new span/turn
-                with self.telemetry.trace_turn(
-                    session_id=self.session_id, prompt=user_input
-                ) as turn_span:
-                    self.messages.append({"role": "user", "content": user_input})
-                    
-                    await self.triggerHook("UsrPromptSubmit")
-
-                    await self._agent_loop()
-                    if self.messages[-1]["role"] == "assistant":
-                        turn_span.set_output(self.messages[-1]["content"])
+                await self.run(input=user_input)
         except (EOFError, KeyboardInterrupt):
             print(f"\n{DIM}Goodbye!{RESET}")
+
+    async def run(self,input : str) :
+        self.session_id = str(uuid.uuid4())
+        with self.telemetry.trace_turn(
+                    session_id=self.session_id, prompt=input
+                ) as turn_span:
+                    self.messages.append({"role": "user", "content": input})                   
+                    await self.triggerHook("UsrPromptSubmit")
+                    await self._agent_loop()
 
     # run agent loop.(Span)
     async def _agent_loop(self):
@@ -329,9 +347,9 @@ class Agent:
                         "content": res,
                     }
                 )
+                await self.triggerHook("PostToolUse")
             cur_round += 1
             # compact tool res before send to llm
-            await self.triggerHook("PostToolUse")
             print()
 
         await self.triggerHook("Stop")
@@ -372,6 +390,9 @@ class Agent:
         return completion.choices[0].message
 
     async def build_system(self) -> None:
+        if self.system_prompt is not None:
+            self.messages[0] ={"role": "system", "content": self.system_prompt}
+            return 
         relevant = ""
         if self.memory:
             relevant = await self.memory.select_relevant_memories(self.messages)
@@ -397,4 +418,4 @@ class Agent:
             )
             sections.append(f"Relevant memory records:\n{memory_records}")
         sys_prompt = "\n\n".join(sections)
-        self.messages.insert(0,{"role": "system", "content": sys_prompt})
+        self.messages[0] = {"role": "system", "content": sys_prompt}

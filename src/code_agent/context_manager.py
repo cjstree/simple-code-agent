@@ -5,6 +5,7 @@ from pathlib import Path
 from openai import AsyncOpenAI
 
 from code_agent import settings
+from code_agent.telemetry import AgentTelemetry
 
 
 def is_tool_use_msg(msg:dict[str,str]) -> bool:
@@ -40,7 +41,12 @@ class ContextManager:
     client : AsyncOpenAI
     context_limit : int
 
-    def __init__(self,  client : AsyncOpenAI,persist_preview_chars: int | None = 1000):
+    def __init__(
+        self,
+        client: AsyncOpenAI,
+        persist_preview_chars: int | None = 1000,
+        telemetry: AgentTelemetry | None = None,
+    ):
         self.max_messages = 30
         self.max_tool_res = 5
         self.max_tool_round_res = 200000
@@ -48,18 +54,33 @@ class ContextManager:
         self.persist_preview_chars = persist_preview_chars
         self.client = client
         self.context_limit = 100000
+        self.telemetry = telemetry if telemetry is not None else AgentTelemetry()
 
     async def compact(self,messages:list[dict[str,str]]):
-        # result compact call after tool call round, not here
-        ret = self._snip_compact(messages)
-        ret = self._micro_compact(ret)
+        with self.telemetry.trace_operation(
+            name="context.compact",
+            span_kind="chain",
+            input_value=messages,
+        ) as span:
+            input_message_count = len(messages)
+            input_size = len(str(messages))
+            # result compact call after tool call round, not here
+            ret = self._snip_compact(messages)
+            ret = self._micro_compact(ret)
 
-        cur_size = len(str(ret))
-        if cur_size > self.context_limit :
-            print(f"[auto compact]: current_size: {cur_size}  compact_threshold:{self.context_limit}")
-            ret  = await self._compact_history(ret)
-            print(f"[auto compact]: finished. current_size: {len(str(ret))}")
-        return ret
+            cur_size = len(str(ret))
+            summarized = cur_size > self.context_limit
+            if summarized:
+                print(f"[auto compact]: current_size: {cur_size}  compact_threshold:{self.context_limit}")
+                ret  = await self._compact_history(ret)
+                print(f"[auto compact]: finished. current_size: {len(str(ret))}")
+            span.set_attribute("context.input.message_count", input_message_count)
+            span.set_attribute("context.output.message_count", len(ret))
+            span.set_attribute("context.input.size", input_size)
+            span.set_attribute("context.output.size", len(str(ret)))
+            span.set_attribute("context.summarized", summarized)
+            span.set_output(ret)
+            return ret
 
 
     # keep the message length not too long
@@ -102,29 +123,42 @@ class ContextManager:
     # not the single tool call. If a tool call round contain too much content, compact the most large res until total
     # tool_res < max_tool_round_res. We use len(content) to estimate the token.
     def _tool_res_compact(self,messages:list[dict[str,str]]) -> list[dict[str,str]]:
-        round_start = len(messages)
-        while round_start > 0 and is_tool_call_res(messages[round_start - 1]):
-            round_start -= 1
-        # compact from the largest content
-        results_by_size = sorted(
-            (
-                (len(messages[index]["content"]), index)
-                for index in range(round_start, len(messages))
-            ),
-            reverse=True,
-        )
-        remaining = sum(size for size, _ in results_by_size)
+        with self.telemetry.trace_operation(
+            name="context.compact_tool_results",
+            span_kind="chain",
+            input_value=messages,
+        ) as span:
+            round_start = len(messages)
+            while round_start > 0 and is_tool_call_res(messages[round_start - 1]):
+                round_start -= 1
+            # compact from the largest content
+            results_by_size = sorted(
+                (
+                    (len(messages[index]["content"]), index)
+                    for index in range(round_start, len(messages))
+                ),
+                reverse=True,
+            )
+            remaining = sum(size for size, _ in results_by_size)
+            input_size = remaining
+            persisted_count = 0
 
-        for size, index in results_by_size:
-            if remaining <= self.max_tool_round_res:
-                break
-            if size < self.persist_threshold:
-                break
-            compacted_content = self._persist_large_output(messages[index])
-            messages[index]["content"] = compacted_content
-            remaining -= size - len(compacted_content)
+            for size, index in results_by_size:
+                if remaining <= self.max_tool_round_res:
+                    break
+                if size < self.persist_threshold:
+                    break
+                compacted_content = self._persist_large_output(messages[index])
+                messages[index]["content"] = compacted_content
+                remaining -= size - len(compacted_content)
+                persisted_count += 1
 
-        return messages
+            span.set_attribute("context.tool_result.count", len(results_by_size))
+            span.set_attribute("context.tool_result.input_size", input_size)
+            span.set_attribute("context.tool_result.output_size", remaining)
+            span.set_attribute("context.tool_result.persisted_count", persisted_count)
+            span.set_output(messages)
+            return messages
 
     # compact all history using llm, keep the sys prompt and the history summary
     async def _compact_history(self,messages:list[dict[str,str]]) :

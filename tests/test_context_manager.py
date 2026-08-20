@@ -1,6 +1,32 @@
+from contextlib import contextmanager
+from typing import Any
+
 import pytest
 
 from code_agent.context_manager import ContextManager, tool_call_range
+
+
+class RecordingSpan:
+    def __init__(self) -> None:
+        self.attributes: dict[str, Any] = {}
+        self.output: Any = None
+
+    def set_attribute(self, key: str, value: Any) -> None:
+        self.attributes[key] = value
+
+    def set_output(self, output: Any) -> None:
+        self.output = output
+
+
+class RecordingTelemetry:
+    def __init__(self) -> None:
+        self.operations: list[tuple[str, str, Any, RecordingSpan]] = []
+
+    @contextmanager
+    def trace_operation(self, *, name: str, span_kind: str, input_value: Any):
+        span = RecordingSpan()
+        self.operations.append((name, span_kind, input_value, span))
+        yield span
 
 
 def tool_result(tool_call_id: str, content: str) -> dict[str, str]:
@@ -137,7 +163,10 @@ def test_micro_compact_keeps_recent_results_and_allows_old_small_results() -> No
 async def test_compact_uses_summary_after_context_limit_is_exceeded(
     monkeypatch,
 ) -> None:
-    manager = ContextManager(object())
+    telemetry = RecordingTelemetry()
+    manager = ContextManager(
+        object(), telemetry=telemetry  # type: ignore[arg-type]
+    )
     manager.context_limit = 0
     manager.max_messages = 100
     messages = [
@@ -156,13 +185,26 @@ async def test_compact_uses_summary_after_context_limit_is_exceeded(
         messages[0],
         {"role": "user", "content": "[Compacted]\n\nsummary"},
     ]
+    name, span_kind, input_value, span = telemetry.operations[0]
+    assert name == "context.compact"
+    assert span_kind == "chain"
+    assert input_value == messages
+    assert span.attributes["context.summarized"] is True
+    assert span.attributes["context.input.message_count"] == 2
+    assert span.attributes["context.output.message_count"] == 2
+    assert span.output == compacted
 
 
 def test_tool_res_compact_persists_largest_current_round_results(
     tmp_path, monkeypatch
 ) -> None:
     monkeypatch.chdir(tmp_path)
-    manager = ContextManager(object(), persist_preview_chars=4)
+    telemetry = RecordingTelemetry()
+    manager = ContextManager(
+        object(),
+        persist_preview_chars=4,
+        telemetry=telemetry,  # type: ignore[arg-type]
+    )
     manager.max_tool_round_res = 200
     manager.persist_threshold = 100
     large_content = "你好世界" * 50
@@ -182,6 +224,12 @@ def test_tool_res_compact_persists_largest_current_round_results(
     assert (
         tmp_path / "task_output/tool_results/large.txt"
     ).read_text() == large_content
+    name, span_kind, _, span = telemetry.operations[0]
+    assert name == "context.compact_tool_results"
+    assert span_kind == "chain"
+    assert span.attributes["context.tool_result.count"] == 2
+    assert span.attributes["context.tool_result.persisted_count"] == 1
+    assert span.output is messages
 
 
 def test_tool_res_compact_stops_when_remaining_results_are_below_threshold(

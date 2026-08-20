@@ -1,10 +1,37 @@
 import json
+from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from code_agent.memory import Memory
+
+
+class RecordingSpan:
+    def __init__(self) -> None:
+        self.attributes: dict[str, Any] = {}
+        self.output: Any = None
+
+    def set_attribute(self, key: str, value: Any) -> None:
+        self.attributes[key] = value
+
+    def set_output(self, output: Any) -> None:
+        self.output = output
+
+    def record_exception(self, error: Exception) -> None:
+        self.attributes["exception"] = error
+
+
+class RecordingTelemetry:
+    def __init__(self) -> None:
+        self.operations: list[tuple[str, str, Any, RecordingSpan]] = []
+
+    @contextmanager
+    def trace_operation(self, *, name: str, span_kind: str, input_value: Any):
+        span = RecordingSpan()
+        self.operations.append((name, span_kind, input_value, span))
+        yield span
 
 
 class FakeCompletions:
@@ -102,7 +129,12 @@ async def test_select_relevant_memories_returns_bodies_in_selected_order(
         encoding="utf-8",
     )
     client = FakeClient("[1, 0]")
-    memory = Memory(memory_dir, client)  # type: ignore[arg-type]
+    telemetry = RecordingTelemetry()
+    memory = Memory(
+        memory_dir,
+        client,  # type: ignore[arg-type]
+        telemetry=telemetry,  # type: ignore[arg-type]
+    )
     memory._rebuild_index()
 
     selected = await memory.select_relevant_memories(
@@ -116,6 +148,15 @@ async def test_select_relevant_memories_returns_bodies_in_selected_order(
     assert request["messages"][0]["role"] == "user"
     assert "What conventions should I follow?" in request["messages"][0]["content"]
     assert "[0]:[Alpha](alpha.md)" in request["messages"][0]["content"]
+    name, span_kind, input_value, span = telemetry.operations[0]
+    assert name == "memory.select_relevant"
+    assert span_kind == "retriever"
+    assert input_value["max_items"] == 2
+    assert span.attributes == {
+        "memory.selected.count": 2,
+        "memory.status": "selected",
+    }
+    assert span.output == ["Zeta body", "Alpha body"]
 
 
 # Scenario: selection returns no more memory bodies than max_items permits.
@@ -180,7 +221,12 @@ async def test_extract_memories_uses_recent_dialogue_and_writes_results(
     ]
     client = FakeClient(json.dumps(extracted))
     memory_dir = tmp_path / "memories"
-    memory = Memory(memory_dir, client)  # type: ignore[arg-type]
+    telemetry = RecordingTelemetry()
+    memory = Memory(
+        memory_dir,
+        client,  # type: ignore[arg-type]
+        telemetry=telemetry,  # type: ignore[arg-type]
+    )
     messages = [{"role": "user", "content": f"dialogue-{index}"} for index in range(32)]
 
     await memory.extract_memories(messages)
@@ -199,6 +245,14 @@ async def test_extract_memories_uses_recent_dialogue_and_writes_results(
         "project",
         "Use Python 3.11+ syntax.",
     )
+    name, span_kind, _, span = telemetry.operations[0]
+    assert name == "memory.extract"
+    assert span_kind == "chain"
+    assert span.attributes == {
+        "memory.extracted.count": 1,
+        "memory.status": "completed",
+    }
+    assert span.output == extracted
 
 
 # Scenario: an empty extraction result does not create any memory files.
