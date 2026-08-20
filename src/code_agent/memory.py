@@ -1,7 +1,7 @@
 from pathlib import Path
 
 import yaml
-from openai import OpenAI
+from openai import AsyncOpenAI
 from pydantic import BaseModel, TypeAdapter
 
 from code_agent import settings
@@ -50,13 +50,13 @@ class Memory :
     '''
 
     path : Path
-    client : OpenAI
-    def __init__(self,path : Path,client : OpenAI) :
+    client : AsyncOpenAI
+    def __init__(self,path : Path,client : AsyncOpenAI) :
         self.path = path
         self.client = client
 
     # extract memory from current messages.
-    def extract_memories(self,messages: list[dict[str,str]]) -> None:
+    async def extract_memories(self,messages: list[dict[str,str]]) -> None:
         # extract dialogue from messages. Save token use.
         # use this format can save more token than using json.
         dialogue_parts = []
@@ -85,7 +85,7 @@ class Memory :
         )
 
         try:
-            completion = self.client.chat.completions.create(
+            completion = await self.client.chat.completions.create(
                 model=settings.settings.llm_model_name,
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=settings.settings.llm_max_tokens,
@@ -164,7 +164,7 @@ class Memory :
         return catalog
 
     # read the index file MEMORY.md. Ask llm client to choose relevant memories.
-    def select_relevant_memories(self,messages, max_items=5) -> list[str]:
+    async def select_relevant_memories(self,messages, max_items=5) -> list[str]:
 
         catalog = self.get_catalog()
         if not catalog.strip():
@@ -183,7 +183,7 @@ class Memory :
                   f"Return [] when none are relevant.\n\n"
                   f"Recent conversation:\n{dialogue}\n\nMemory catalog:\n{catalog}")
         try:
-            completion = self.client.chat.completions.create(
+            completion = await self.client.chat.completions.create(
                 model=settings.settings.llm_model_name,
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=settings.settings.llm_max_tokens,
@@ -243,4 +243,3 @@ class Memory :
     # TODO : merge old memory files
     def consolidate_memories():
         pass
-    

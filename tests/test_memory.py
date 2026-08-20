@@ -2,6 +2,8 @@ import json
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from code_agent.memory import Memory
 
 
@@ -10,7 +12,7 @@ class FakeCompletions:
         self._responses = iter(responses)
         self.calls: list[dict[str, Any]] = []
 
-    def create(self, **kwargs: Any) -> SimpleNamespace:
+    async def create(self, **kwargs: Any) -> SimpleNamespace:
         self.calls.append(kwargs)
         return SimpleNamespace(
             choices=[
@@ -85,7 +87,8 @@ def test_rebuild_index_is_sorted_and_excludes_catalog(tmp_path) -> None:
 
 
 # Scenario: selected indices return memory bodies in the model-provided order.
-def test_select_relevant_memories_returns_bodies_in_selected_order(
+@pytest.mark.asyncio
+async def test_select_relevant_memories_returns_bodies_in_selected_order(
     tmp_path,
 ) -> None:
     memory_dir = tmp_path / "memories"
@@ -102,7 +105,7 @@ def test_select_relevant_memories_returns_bodies_in_selected_order(
     memory = Memory(memory_dir, client)  # type: ignore[arg-type]
     memory._rebuild_index()
 
-    selected = memory.select_relevant_memories(
+    selected = await memory.select_relevant_memories(
         [{"role": "user", "content": "What conventions should I follow?"}],
         max_items=2,
     )
@@ -116,7 +119,8 @@ def test_select_relevant_memories_returns_bodies_in_selected_order(
 
 
 # Scenario: selection returns no more memory bodies than max_items permits.
-def test_select_relevant_memories_respects_max_items(tmp_path) -> None:
+@pytest.mark.asyncio
+async def test_select_relevant_memories_respects_max_items(tmp_path) -> None:
     memory_dir = tmp_path / "memories"
     memory_dir.mkdir()
     (memory_dir / "alpha.md").write_text(
@@ -131,13 +135,14 @@ def test_select_relevant_memories_respects_max_items(tmp_path) -> None:
     memory = Memory(memory_dir, client)  # type: ignore[arg-type]
     memory._rebuild_index()
 
-    selected = memory.select_relevant_memories([], max_items=1)
+    selected = await memory.select_relevant_memories([], max_items=1)
 
     assert selected == ["Zeta body"]
 
 
 # Scenario: missing storage or an invalid model response yields no memories.
-def test_select_relevant_memories_returns_empty_for_missing_or_invalid_data(
+@pytest.mark.asyncio
+async def test_select_relevant_memories_returns_empty_for_missing_or_invalid_data(
     tmp_path,
 ) -> None:
     missing_client = FakeClient()
@@ -146,7 +151,7 @@ def test_select_relevant_memories_returns_empty_for_missing_or_invalid_data(
         missing_client,  # type: ignore[arg-type]
     )
 
-    assert missing_memory.select_relevant_memories([]) == []
+    assert await missing_memory.select_relevant_memories([]) == []
     assert missing_client.completions.calls == []
 
     memory_dir = tmp_path / "invalid"
@@ -157,11 +162,14 @@ def test_select_relevant_memories_returns_empty_for_missing_or_invalid_data(
     invalid_client = FakeClient("not valid JSON")
     invalid_memory = Memory(memory_dir, invalid_client)  # type: ignore[arg-type]
 
-    assert invalid_memory.select_relevant_memories([]) == []
+    assert await invalid_memory.select_relevant_memories([]) == []
 
 
 # Scenario: extraction considers the latest 30 messages and persists new memories.
-def test_extract_memories_uses_recent_dialogue_and_writes_results(tmp_path) -> None:
+@pytest.mark.asyncio
+async def test_extract_memories_uses_recent_dialogue_and_writes_results(
+    tmp_path,
+) -> None:
     extracted = [
         {
             "name": "Python Version",
@@ -175,7 +183,7 @@ def test_extract_memories_uses_recent_dialogue_and_writes_results(tmp_path) -> N
     memory = Memory(memory_dir, client)  # type: ignore[arg-type]
     messages = [{"role": "user", "content": f"dialogue-{index}"} for index in range(32)]
 
-    memory.extract_memories(messages)
+    await memory.extract_memories(messages)
 
     assert len(client.completions.calls) == 1
     prompt = client.completions.calls[0]["messages"][0]["content"]
@@ -194,14 +202,15 @@ def test_extract_memories_uses_recent_dialogue_and_writes_results(tmp_path) -> N
 
 
 # Scenario: an empty extraction result does not create any memory files.
-def test_extract_memories_does_not_write_when_nothing_is_extracted(
+@pytest.mark.asyncio
+async def test_extract_memories_does_not_write_when_nothing_is_extracted(
     tmp_path,
 ) -> None:
     client = FakeClient("[]")
     memory_dir = tmp_path / "memories"
     memory = Memory(memory_dir, client)  # type: ignore[arg-type]
 
-    memory.extract_memories([{"role": "user", "content": "hello"}])
+    await memory.extract_memories([{"role": "user", "content": "hello"}])
 
     assert len(client.completions.calls) == 1
     assert not list(memory_dir.glob("*.md"))

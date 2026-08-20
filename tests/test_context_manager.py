@@ -1,3 +1,5 @@
+import pytest
+
 from code_agent.context_manager import ContextManager, tool_call_range
 
 
@@ -131,7 +133,10 @@ def test_micro_compact_keeps_recent_results_and_allows_old_small_results() -> No
     assert results["recent-two"] == recent_two
 
 
-def test_compact_uses_summary_after_context_limit_is_exceeded(monkeypatch) -> None:
+@pytest.mark.asyncio
+async def test_compact_uses_summary_after_context_limit_is_exceeded(
+    monkeypatch,
+) -> None:
     manager = ContextManager(object())
     manager.context_limit = 0
     manager.max_messages = 100
@@ -139,9 +144,13 @@ def test_compact_uses_summary_after_context_limit_is_exceeded(monkeypatch) -> No
         {"role": "user", "content": "original goal"},
         {"role": "assistant", "content": "work so far"},
     ]
-    monkeypatch.setattr(manager, "_summary_history", lambda value: "summary")
 
-    compacted = manager.compact(messages)
+    async def summarize(value: list[dict[str, str]]) -> str:
+        return "summary"
+
+    monkeypatch.setattr(manager, "_summary_history", summarize)
+
+    compacted = await manager.compact(messages)
 
     assert compacted == [
         messages[0],

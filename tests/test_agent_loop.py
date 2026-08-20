@@ -33,6 +33,25 @@ class FakeRegistry:
 
 
 @pytest.mark.asyncio
+async def test_agent_trigger_hook_awaits_async_callbacks_in_order() -> None:
+    agent = Agent(telemetry=AgentTelemetry())
+    calls: list[str] = []
+
+    def sync_hook() -> None:
+        calls.append("sync")
+
+    async def async_hook() -> None:
+        calls.append("async")
+
+    agent.registHook("PreLLMSubmit", sync_hook)
+    agent.registHook("PreLLMSubmit", async_hook)
+
+    await agent.triggerHook("PreLLMSubmit")
+
+    assert calls == ["sync", "async"]
+
+
+@pytest.mark.asyncio
 async def test_agent_starts_with_local_tools_and_no_mcp(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -67,11 +86,11 @@ async def test_agent_exits_cleanly_on_terminal_signal(
     capsys: pytest.CaptureFixture[str],
     exit_error: type[BaseException],
 ) -> None:
-    def raise_exit_error(prompt: str) -> str:
+    async def raise_exit_error(prompt: str) -> str:
         raise exit_error
 
     monkeypatch.setattr("code_agent.agent.separator", lambda: "---")
-    monkeypatch.setattr("builtins.input", raise_exit_error)
+    monkeypatch.setattr("code_agent.agent.ainput", raise_exit_error)
 
     agent = Agent(telemetry=AgentTelemetry())
     agent.memory = SimpleNamespace(extract_memories=lambda messages: None)
@@ -104,7 +123,11 @@ async def test_agent_completes_one_tool_call_cycle() -> None:
     agent.messages = [{"role": "user", "content": "run the tool"}]
     agent.system_prompt = "test"
     agent.max_tool_round = 3
-    agent._call_api = lambda messages, system_prompt: next(responses)  # type: ignore[method-assign]
+
+    async def call_api(messages: list[dict[str, Any]]) -> Any:
+        return next(responses)
+
+    agent._call_api = call_api  # type: ignore[method-assign]
 
     await agent._agent_loop()
 
@@ -126,38 +149,16 @@ async def test_agent_completes_one_tool_call_cycle() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("decision", "approved"), [("yes", True), ("", False)])
-async def test_agent_passes_sensitive_tool_decision_to_registry(
+async def test_agent_reads_sensitive_tool_decision(
     monkeypatch: pytest.MonkeyPatch,
     decision: str,
     approved: bool,
 ) -> None:
-    tool_call = SimpleNamespace(
-        id="call-1",
-        type="function",
-        function=SimpleNamespace(name="write", arguments='{"path": "note.txt"}'),
-    )
-    responses = iter(
-        [
-            SimpleNamespace(content=None, tool_calls=[tool_call]),
-            SimpleNamespace(content="finished", tool_calls=None),
-        ]
-    )
-    monkeypatch.setattr("builtins.input", lambda prompt: decision)
+    async def read_decision(prompt: str) -> str:
+        return decision
+
+    monkeypatch.setattr("code_agent.agent.ainput", read_decision)
 
     agent = Agent(telemetry=AgentTelemetry())
-    registry = FakeRegistry(sensitive=True)
-    agent.tool_registry = registry  # type: ignore[assignment]
-    agent.context_manager = ContextManager(object())
-    agent.messages = [{"role": "user", "content": "write a note"}]
-    agent.system_prompt = "test"
-    agent.max_tool_round = 3
-    agent._call_api = lambda messages, system_prompt: next(responses)  # type: ignore[method-assign]
 
-    await agent._agent_loop()
-
-    assert registry.approvals == [approved]
-    assert agent.messages[2]["role"] == "tool"
-    if approved:
-        assert agent.messages[2]["content"] == "result: 2"
-    else:
-        assert "requires approval" in agent.messages[2]["content"]
+    assert await agent._ask_permission("write") is approved

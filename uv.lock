@@ -8,6 +8,15 @@ resolution-markers = [
 ]
 
 [[package]]
+name = "aioconsole"
+version = "0.8.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/76/4a/71f535c85991e18e1626429a283d4fc6720053f38211affa888809089ded/aioconsole-0.8.2.tar.gz", hash = "sha256:25cb5530f58f7ab431e9af84fbb5417178287b6c3300d5b1185e3b129a227cef", size = 37712, upload-time = "2025-10-14T05:44:33.245Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/03/10/04ef3313a07e9152a84ce197aa11586376478c167322141e9c79eaedc25b/aioconsole-0.8.2-py3-none-any.whl", hash = "sha256:00f3fabd6de5df2fad635e1e6a13ebe5bb2456b83b31e881ae41bc5862fd6a68", size = 31510, upload-time = "2025-10-14T05:44:32.161Z" },
+]
+
+[[package]]
 name = "annotated-types"
 version = "0.8.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1348,6 +1357,7 @@ name = "standalone-code-agent"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "aioconsole" },
     { name = "httpx", extra = ["socks"] },
     { name = "mcp" },
     { name = "openai" },
@@ -1370,6 +1380,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "aioconsole", specifier = ">=0.8.0" },
     { name = "arize-phoenix-otel", marker = "extra == 'telemetry'", specifier = ">=0.16.0" },
     { name = "httpx", extras = ["socks"], specifier = ">=0.28.0" },
     { name = "mcp", specifier = ">=2.0.0" },

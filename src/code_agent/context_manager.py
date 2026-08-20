@@ -1,8 +1,8 @@
 
 import json
-
-from openai import OpenAI
 from pathlib import Path
+
+from openai import AsyncOpenAI
 
 from code_agent import settings
 
@@ -37,10 +37,10 @@ class ContextManager:
     max_tool_round_res : int
     persist_threshold : int
     persist_preview_chars: int
-    client : OpenAI
+    client : AsyncOpenAI
     context_limit : int
 
-    def __init__(self,  client : OpenAI,persist_preview_chars: int | None = 1000):
+    def __init__(self,  client : AsyncOpenAI,persist_preview_chars: int | None = 1000):
         self.max_messages = 30
         self.max_tool_res = 5
         self.max_tool_round_res = 200000
@@ -49,7 +49,7 @@ class ContextManager:
         self.client = client
         self.context_limit = 100000
 
-    def compact(self,messages:list[dict[str,str]]):
+    async def compact(self,messages:list[dict[str,str]]):
         # result compact call after tool call round, not here
         ret = self._snip_compact(messages)
         ret = self._micro_compact(ret)
@@ -57,7 +57,7 @@ class ContextManager:
         cur_size = len(str(ret))
         if cur_size > self.context_limit :
             print(f"[auto compact]: current_size: {cur_size}  compact_threshold:{self.context_limit}")
-            ret  = self._compact_history(ret)
+            ret  = await self._compact_history(ret)
             print(f"[auto compact]: finished. current_size: {len(str(ret))}")
         return ret
 
@@ -127,8 +127,8 @@ class ContextManager:
         return messages
 
     # compact all history using llm, keep the sys prompt and the history summary
-    def _compact_history(self,messages:list[dict[str,str]]) :
-        summary = self._summary_history(messages)
+    async def _compact_history(self,messages:list[dict[str,str]]) :
+        summary = await self._summary_history(messages)
         return [messages[0],{"role":"user","content":f"[Compacted]\n\n{summary}"}]
 
     # persist large_output in ./task_output/tool_results
@@ -157,13 +157,13 @@ class ContextManager:
         )
 
     # summary the message history
-    def _summary_history(self,messages : list[dict[str,str]]) -> str:
+    async def _summary_history(self,messages : list[dict[str,str]]) -> str:
         history = json.dumps(messages,ensure_ascii=False)
         prompt = ("Summarize this coding-agent conversation so work can continue.\n"
               "Preserve: 1. current goal, 2. key findings/decisions, 3. files read/changed, "
               "4. remaining work, 5. user constraints.\nBe compact but concrete.\n\n" + history)
         openai_message = [{"role": "user", "content": prompt}]
-        completion = self.client.chat.completions.create(
+        completion = await self.client.chat.completions.create(
             model=settings.llm_model_name,
             messages=openai_message,
             max_tokens=settings.llm_max_tokens,

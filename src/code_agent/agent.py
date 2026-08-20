@@ -1,5 +1,6 @@
 """Agent orchestration."""
 
+import inspect
 import json
 import os
 import re
@@ -8,7 +9,8 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from openai import OpenAI
+from aioconsole import ainput
+from openai import AsyncOpenAI
 
 from code_agent.background_manager import BackgroundManager
 from code_agent.context_manager import ContextManager
@@ -99,7 +101,7 @@ def _parse_frontmatter(text: str) -> tuple[dict, str]:
 class Agent:
     "an agent implemention. using cli command to intereact. can use tools."
 
-    client: OpenAI
+    client: AsyncOpenAI
     tool_registry: ToolRegistry
     messages: list
     system_prompt: str
@@ -142,11 +144,13 @@ class Agent:
     def registHook(self, event: str, func: callable):
         self.hooks[event].append(func)
 
-    def triggerHook(self, event: str, **kargs):
+    async def triggerHook(self, event: str, **kargs):
         for func in self.hooks[event]:
             ret = func(**kargs)
+            if inspect.isawaitable(ret):
+                ret = await ret
             # if has return, means something wrong. Like permission deny
-            if ret:
+            if ret is not None:
                 return ret
 
 
@@ -162,9 +166,9 @@ class Agent:
             LoadSkillsTool(self.skill_registry),
         ]
 
-    def compact(self) -> None :
+    async def compact(self) -> None :
         if len(self.messages) > 4 and self.context_manager:
-            self.messages = self.context_manager.compact(self.messages)
+            self.messages = await self.context_manager.compact(self.messages)
 
     def collect_bg_result(self) -> None:
         if self.bgManager:
@@ -178,9 +182,9 @@ class Agent:
                 content =  f"{header}\n" + "\n".join(lines)
                 self.messages.append({"role":"user","content":content})
 
-    def check_tool_permission(self,tool_name):
+    async def check_tool_permission(self,tool_name):
         if self.tool_registry.requires_approval(tool_name):
-            approved = self._ask_permission(tool_name)
+            approved = await self._ask_permission(tool_name)
             if approved == False:
                 return False
     def compact_tool_res(self):
@@ -198,7 +202,7 @@ class Agent:
                 "LLM_API_KEY and LLM_MODEL_NAME must be configured in agent/.env"
             )
 
-        self.client = OpenAI(
+        self.client = AsyncOpenAI(
             api_key=settings.llm_api_key,
             base_url=settings.llm_base_url,
         )
@@ -243,7 +247,7 @@ class Agent:
         try:
             while True:
                 print(separator())
-                user_input = input(f"{BOLD}{BLUE}❯{RESET} ").strip()
+                user_input = (await ainput(f"{BOLD}{BLUE}❯{RESET} ")).strip()
                 print(separator())
 
                 if not user_input:
@@ -262,7 +266,7 @@ class Agent:
                 ) as turn_span:
                     self.messages.append({"role": "user", "content": user_input})
                     
-                    self.triggerHook("UsrPromptSubmit")
+                    await self.triggerHook("UsrPromptSubmit")
 
                     await self._agent_loop()
                     if self.messages[-1]["role"] == "assistant":
@@ -274,9 +278,9 @@ class Agent:
     async def _agent_loop(self):
         cur_round = 0
         while cur_round < self.max_tool_round:
-            self.triggerHook("PreLLMSubmit")
+            await self.triggerHook("PreLLMSubmit")
             # call the llm.
-            resp = self._call_api(self.messages)
+            resp = await self._call_api(self.messages)
             self.messages.append(rsp2msg(resp))
             # print response content
             if resp.content:
@@ -298,10 +302,10 @@ class Agent:
                             f"\n{GREEN}⏺ {tool_name.capitalize()}{RESET}"
                             f"({DIM}{argument_text}{RESET})"
                         )
-                        approved = True
-                        ret =self.triggerHook("PreToolUse")
-                        if ret:
-                            approved = False
+                        
+                        ret = await self.triggerHook("PreToolUse",tool_name = tool_name)
+                        approved = ret is None
+                        
                         # run the tool
                         res = await self.tool_registry.run_tool(
                             tool_name=tool_name,
@@ -327,11 +331,10 @@ class Agent:
                 )
             cur_round += 1
             # compact tool res before send to llm
-            self.triggerHook("PostToolUse")
-            self.messages =  self.context_manager._tool_res_compact(self.messages)
+            await self.triggerHook("PostToolUse")
             print()
 
-        self.triggerHook("Stop")
+        await self.triggerHook("Stop")
         # stop because achieve max tool call round
         if cur_round == self.max_tool_round:
             print("Maximum tool-call rounds reached.")
@@ -339,8 +342,10 @@ class Agent:
             pass
             # stop because not more tool calls
 
-    def _ask_permission(self, tool_name: str) -> bool:
-        decision = input(f"{YELLOW}Approve {tool_name} for this call? [y/N] {RESET}")
+    async def _ask_permission(self, tool_name: str) -> bool:
+        decision = await ainput(
+            f"{YELLOW}Approve {tool_name} for this call? [y/N] {RESET}"
+        )
         return decision.strip().lower() in {
             "y",
             "yes",
@@ -355,9 +360,9 @@ class Agent:
             preview += "..."
         print(f"  {DIM}⎿  {preview}{RESET}")
 
-    def _call_api(self, messages: list):
+    async def _call_api(self, messages: list):
         openai_messages = messages
-        completion = self.client.chat.completions.create(
+        completion = await self.client.chat.completions.create(
             model=settings.llm_model_name,
             messages=openai_messages,
             tools=self.tool_registry.get_tools_desc(),
@@ -366,10 +371,10 @@ class Agent:
         )
         return completion.choices[0].message
 
-    def build_system(self) -> None:
+    async def build_system(self) -> None:
         relevant = ""
         if self.memory:
-            relevant =  self.memory.select_relevant_memories(self.messages)
+            relevant = await self.memory.select_relevant_memories(self.messages)
 
         sections = [
             (

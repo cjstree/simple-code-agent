@@ -5,6 +5,7 @@ description = "A small standalone CLI coding agent with optional MCP tools."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "aioconsole>=0.8.0",
     "httpx[socks]>=0.28.0",
     "mcp>=2.0.0",
     "openai>=1.0.0",
