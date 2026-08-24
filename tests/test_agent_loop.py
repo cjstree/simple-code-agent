@@ -97,7 +97,7 @@ async def test_agent_run_can_be_called_without_cli_loop(
 
         result = await agent.run("hello")
 
-        assert result is None
+        assert result is not None
         assert loop_calls == 1
         assert agent.messages == [
             {"role": "system", "content": "test system"},

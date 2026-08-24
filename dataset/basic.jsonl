@@ -1,0 +1,2 @@
+{"id":"qa_01","input":"What is 2 + 3? Answer with only the number.","target":"5"}
+{"id":"qa_02","input":"What is 10 - 3? Answer with only the number.","target":"7"}

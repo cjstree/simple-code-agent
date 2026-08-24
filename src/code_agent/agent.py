@@ -125,7 +125,7 @@ class Agent:
         }
         self.bgManager = BackgroundManager()
         self.system_prompt = system_prompt
-        self.messages = [{}]
+        self.messages = []
         self._exit_stack: AsyncExitStack | None = None
         self.mcp_client: MCPClient | None = None
     def _list_skills(self) -> str:
@@ -273,17 +273,25 @@ class Agent:
                 if user_input in ("/q", "exit"):
                     break
                 if user_input == "/c":
-                    self.messages = [{}]
+                    self.messages = []
                     self.session_id = str(uuid.uuid4())
                     print(f"{GREEN}⏺ Cleared conversation{RESET}")
                     continue
 
                 # start a new span/turn
-                await self.run(input=user_input)
+                # await self.run(input=user_input)
+                with self.telemetry.trace_turn(
+                    session_id=self.session_id, prompt=user_input
+                ) as turn_span:
+                    self.messages.append({"role": "user", "content": user_input})                   
+                    await self.triggerHook("UsrPromptSubmit")
+                    await self._agent_loop()
+
         except (EOFError, KeyboardInterrupt):
             print(f"\n{DIM}Goodbye!{RESET}")
 
-    async def run(self,input : str) :
+    # run a single input.
+    async def run(self,input : str) -> str:
         self.session_id = str(uuid.uuid4())
         with self.telemetry.trace_turn(
                     session_id=self.session_id, prompt=input
@@ -291,6 +299,7 @@ class Agent:
                     self.messages.append({"role": "user", "content": input})                   
                     await self.triggerHook("UsrPromptSubmit")
                     await self._agent_loop()
+                    return self.messages[-1]["content"]
 
     # run agent loop.(Span)
     async def _agent_loop(self):
@@ -390,6 +399,9 @@ class Agent:
         return completion.choices[0].message
 
     async def build_system(self) -> None:
+        # the first message must be system prompt!
+        if len(self.messages) == 0 or self.messages[0].get("role",None) != "system" : 
+            self.messages.insert(0,{})
         if self.system_prompt is not None:
             self.messages[0] ={"role": "system", "content": self.system_prompt}
             return 
