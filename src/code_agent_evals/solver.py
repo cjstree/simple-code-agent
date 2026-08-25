@@ -1,40 +1,38 @@
-from inspect_ai.agent import agent_bridge
+import sys
+
+from inspect_ai.agent import sandbox_agent_bridge
 from inspect_ai.model import ModelOutput
 from inspect_ai.solver import Generate, Solver, TaskState, solver
-
-from code_agent.agent import Agent
-from code_agent.settings import settings
-from code_agent.telemetry import AgentTelemetry
+from inspect_ai.util import sandbox
 
 
 @solver
 def my_agent_solver() -> Solver:
-
     async def solve(
         state: TaskState,
         generate: Generate,
     ) -> TaskState:
-        telemetry = AgentTelemetry.initialize(
-            enabled=settings.phoenix_enabled,
-            endpoint=settings.phoenix_collector_endpoint,
-            project_name=settings.phoenix_project_name,
-        )
-        agent = Agent(telemetry=telemetry)
-        try:
-            async with agent_bridge(forward_generation_config=True):
-                await agent.start()
-                result = await agent.run(state.input_text)
-        except KeyboardInterrupt:
-            print()
-        finally:
-            try:
-                await agent.close()
-            finally:
-                telemetry.shutdown()
+        del generate
+
+        async with sandbox_agent_bridge(forward_generation_config=True) as bridge:
+            result = await sandbox().exec(
+                [sys.executable, "-m", "code_agent_evals.runner"],
+                input=state.input_text,
+                env={
+                    "LLM_API_KEY": "inspect-eval",
+                    "LLM_BASE_URL": f"http://localhost:{bridge.port}/v1",
+                    "LLM_MODEL_NAME": "inspect",
+                },
+                timeout=300,
+            )
+
+        if not result.success:
+            details = "\n".join(part for part in (result.stdout, result.stderr) if part)
+            raise RuntimeError(f"Agent subprocess failed:\n{details}")
 
         state.output = ModelOutput.from_content(
             model="my-agent",
-            content=result,
+            content=result.stdout.strip(),
         )
         return state
 

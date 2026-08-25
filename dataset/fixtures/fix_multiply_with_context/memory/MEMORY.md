@@ -1,0 +1,1 @@
+- [0]:[Project Arithmetic Convention](project-arithmetic.md) — Multiplication helpers return the product of their operands

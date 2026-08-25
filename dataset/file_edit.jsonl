@@ -1,0 +1,2 @@
+{"id":"fix_add","input":"Fix the add function in calculator.py so that the tests pass. Run the tests to verify the change.","target":"","files":{".":"fixtures/fix_add"}}
+{"id":"fix_multiply_with_context","input":"Fix the multiply function in calculator.py so that the tests pass. Use the available arithmetic-fix skill and project memory as guidance, then run the tests.","target":"","files":{".":"fixtures/fix_multiply_with_context"}}
