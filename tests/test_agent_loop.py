@@ -18,6 +18,9 @@ class FakeRegistry:
     def requires_approval(self, tool_name: str) -> bool:
         return self.sensitive
 
+    def get_tools_desc(self) -> list[dict[str, Any]]:
+        return []
+
     async def run_tool(
         self,
         tool_name: str,
@@ -30,6 +33,20 @@ class FakeRegistry:
         if self.sensitive and not approved:
             raise PermissionError(f"Tool {tool_name} requires approval.")
         return "result: 2"
+
+
+class FakeAsyncStream:
+    def __init__(self, *chunks: Any) -> None:
+        self._chunks = iter(chunks)
+
+    def __aiter__(self) -> "FakeAsyncStream":
+        return self
+
+    async def __anext__(self) -> Any:
+        try:
+            return next(self._chunks)
+        except StopIteration as error:
+            raise StopAsyncIteration from error
 
 
 @pytest.mark.asyncio
@@ -166,6 +183,127 @@ async def test_agent_exits_cleanly_on_terminal_signal(
     await agent.cli_loop()
 
     assert "Goodbye!" in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_cli_loop_explicitly_enables_streaming(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inputs = iter(["hello", "exit"])
+    stream_values: list[bool] = []
+
+    async def fake_input(prompt: str) -> str:
+        del prompt
+        return next(inputs)
+
+    async def fake_agent_loop(*, stream: bool = False) -> None:
+        stream_values.append(stream)
+
+    monkeypatch.setattr("code_agent.agent.ainput", fake_input)
+    agent = Agent(telemetry=AgentTelemetry())
+    monkeypatch.setattr(agent, "_agent_loop", fake_agent_loop)
+
+    await agent.cli_loop()
+
+    assert stream_values == [True]
+
+
+@pytest.mark.asyncio
+async def test_streaming_prints_raw_text_once_and_stores_complete_message(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    chunks = FakeAsyncStream(
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(delta=SimpleNamespace(content="**bo", tool_calls=None))
+            ]
+        ),
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(delta=SimpleNamespace(content="ld**", tool_calls=None))
+            ]
+        ),
+    )
+    calls: list[dict[str, Any]] = []
+
+    class FakeCompletions:
+        async def create(self, **kwargs: Any) -> FakeAsyncStream:
+            calls.append(kwargs)
+            return chunks
+
+    agent = Agent(telemetry=AgentTelemetry())
+    agent.client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    agent.tool_registry = FakeRegistry()  # type: ignore[assignment]
+    agent.messages = [{"role": "user", "content": "hello"}]
+    agent.max_tool_round = 1
+
+    await agent._agent_loop(stream=True)
+
+    output = capsys.readouterr().out
+    assert output.count("**bold**") == 1
+    assert agent.messages[-1] == {"role": "assistant", "content": "**bold**"}
+    assert calls[0]["stream"] is True
+
+
+@pytest.mark.asyncio
+async def test_streaming_reassembles_fragmented_tool_calls() -> None:
+    chunks = FakeAsyncStream(
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(
+                        content=None,
+                        tool_calls=[
+                            SimpleNamespace(
+                                index=0,
+                                id="call-1",
+                                type="function",
+                                function=SimpleNamespace(
+                                    name="echo", arguments='{"val'
+                                ),
+                            )
+                        ],
+                    )
+                )
+            ]
+        ),
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(
+                        content=None,
+                        tool_calls=[
+                            SimpleNamespace(
+                                index=0,
+                                id=None,
+                                type=None,
+                                function=SimpleNamespace(
+                                    name=None, arguments='ue": 2}'
+                                ),
+                            )
+                        ],
+                    )
+                )
+            ]
+        ),
+    )
+
+    class FakeCompletions:
+        async def create(self, **kwargs: Any) -> FakeAsyncStream:
+            assert kwargs["stream"] is True
+            return chunks
+
+    agent = Agent(telemetry=AgentTelemetry())
+    agent.client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    agent.tool_registry = FakeRegistry()  # type: ignore[assignment]
+
+    response = await agent._call_api([], stream=True)
+
+    assert response.content is None
+    assert response.tool_calls is not None
+    assert response.tool_calls[0].id == "call-1"
+    assert response.tool_calls[0].function.name == "echo"
+    assert response.tool_calls[0].function.arguments == '{"value": 2}'
 
 
 @pytest.mark.asyncio
