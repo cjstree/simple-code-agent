@@ -193,7 +193,7 @@ def _grep_files(path: str, pattern: re.Pattern[str]) -> list[str]:
 
 class BashArguments(BaseModel):
     cmd: str
-    run_in_background : bool
+    run_in_background : bool = False
 
 
 class BashTool:

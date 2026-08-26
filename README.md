@@ -68,20 +68,22 @@ uv run python -m pytest tests/test_skills.py -q
 `local` sandbox 只提供独立临时工作目录，不是安全边界。Agent 执行的命令仍然
 运行在宿主机上，这套配置只用于可信的轻量端到端测试。
 
-### 模型配置
+### 模型与追踪配置
 
-Inspect 是实际连接模型服务的一方，其配置与 Agent 使用的 `LLM_*` 配置分开。
-例如使用 DeepSeek provider 时，可以在 `.env` 中设置：
+Eval runner 不使用 Inspect model bridge。Agent 按常规 CLI 配置直接连接模型，
+因此在项目 `.env` 中设置 `LLM_API_KEY`、`LLM_BASE_URL` 和
+`LLM_MODEL_NAME` 即可；`INSPECT_EVAL_MODEL` 不控制 Agent 使用的模型。
+
+如需在 Phoenix 中观察 eval，继续使用 Agent 自身的追踪配置：
 
 ```dotenv
-INSPECT_EVAL_MODEL=deepseek/<model-name>
-DEEPSEEK_API_KEY=<api-key>
-DEEPSEEK_BASE_URL=https://api.deepseek.com
+PHOENIX_ENABLED=true
+PHOENIX_COLLECTOR_ENDPOINT=http://localhost:6006/v1/traces
+PHOENIX_PROJECT_NAME=code-agent-eval
 ```
 
-DeepSeek 的默认地址已经是 `https://api.deepseek.com`，通常可以省略
-`DEEPSEEK_BASE_URL`。跨 provider 通用的地址变量是
-`INSPECT_EVAL_MODEL_BASE_URL`。
+Inspect 仍负责创建样例工作目录、执行 solver 和运行 pytest scorer，但模型调用、
+token 配置和 Phoenix telemetry 均由 Agent 自己负责。
 
 ### 样例目录结构
 
@@ -143,10 +145,23 @@ Memory content used by the Agent.
 {"id":"fix_example","input":"Fix the implementation and run the tests.","target":"","files":{".":"fixtures/fix_example"}}
 ```
 
+多轮样例把连续用户输入放在 `metadata.turns` 中。所有轮次复用同一个
+Agent 和消息历史；`agent_config` 可以降低 eval 中的 compact 阈值：
+
+```json
+{"id":"compact_example","input":"Complete the multi-turn task.","target":"","metadata":{"turns":["Inspect the implementation; do not edit yet.","Preserve the public API.","Now fix it and run the tests."],"agent_config":{"max_messages":8,"context_limit":2000}},"files":{".":"fixtures/compact_example"}}
+```
+
+`agent_config` 仅支持 `context_limit`、`max_messages`、`max_tool_res`、
+`max_tool_round_res` 和 `persist_threshold`，值必须为正整数。省略
+`metadata.turns` 时，runner 仍将 `input` 作为单轮任务执行。
+
 字段含义：
 
 - `id`：样例唯一标识，用于 `--sample-id` 选择样例。
 - `input`：提交给 Agent 的任务描述。
+- `metadata.turns`：可选的连续用户回合；同一样例内共享 Agent 状态。
+- `metadata.agent_config`：可选的 eval 专用 ContextManager 阈值。
 - `target`：当前 pytest scorer 不使用文本 target，可以保留为空字符串。
 - `files`：sandbox 目标路径到源文件或目录的映射。
 - `files` 中的 `"."` 表示把 fixture 目录内容复制到样例工作目录根部。
@@ -192,5 +207,5 @@ uv run inspect eval \
 - `@basic_agent_eval` 指定该文件中由 `@task` 注册的任务函数。
 
 当一个 Python 文件包含多个 Inspect Task 时，`@<task-name>` 可以只运行指定任务。
-当前 local bridge 使用固定代理端口，因此示例使用 `--max-samples 1` 和
-`--max-tasks 1` 串行执行。
+示例保留 `--max-samples 1` 和 `--max-tasks 1`，方便逐个观察 Agent 行为；
+不再存在 bridge 固定代理端口的限制。

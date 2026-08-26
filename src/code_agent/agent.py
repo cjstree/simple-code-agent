@@ -201,10 +201,9 @@ class Agent:
         if self.context_manager:
             self.messages =  self.context_manager._tool_res_compact(self.messages)
     # TODO: add extract frequency control
-    def extract_memory(self):
+    async def extract_memory(self) -> None:
         if self.memory:
-            #self.memory.extract_memories(self.messages) 
-            pass
+            await self.memory.extract_memories(self.messages)
 
     async def start(self):
         if not settings.llm_api_key or not settings.llm_model_name:
@@ -296,11 +295,19 @@ class Agent:
             print(f"\n{DIM}Goodbye!{RESET}")
 
     # run a single input.
-    async def run(self, input: str, *, stream: bool = False) -> str:
-        self.session_id = str(uuid.uuid4())
+    async def run(
+        self,
+        input: str,
+        *,
+        stream: bool = False,
+        new_session: bool = True,
+    ) -> str:
+        if new_session:
+            self.session_id = str(uuid.uuid4())
         with self.telemetry.trace_turn(session_id=self.session_id, prompt=input):
             self.messages.append({"role": "user", "content": input})
             await self.triggerHook("UsrPromptSubmit")
+            # TODO:simplify
             if stream:
                 await self._agent_loop(stream=True)
             else:

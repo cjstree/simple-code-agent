@@ -124,6 +124,53 @@ async def test_agent_run_can_be_called_without_cli_loop(
         await agent.close()
 
 
+# Consecutive programmatic turns can opt into one telemetry session while the
+# public run method continues to create a new session by default.
+@pytest.mark.asyncio
+async def test_agent_run_can_reuse_or_create_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "llm_api_key", "test-key")
+    monkeypatch.setattr(settings, "llm_model_name", "test-model")
+    monkeypatch.setattr(settings, "mcp_url", None)
+    agent = Agent(telemetry=AgentTelemetry(), system_prompt="test system")
+
+    async def fake_agent_loop() -> None:
+        return None
+
+    try:
+        await agent.start()
+        monkeypatch.setattr(agent, "_agent_loop", fake_agent_loop)
+
+        await agent.run("first")
+        first_session = agent.session_id
+        await agent.run("second", new_session=False)
+        assert agent.session_id == first_session
+
+        await agent.run("third")
+        assert agent.session_id != first_session
+    finally:
+        await agent.close()
+
+
+# The Stop hook awaits memory extraction so writes complete before the turn
+# returns to a multi-turn evaluation runner.
+@pytest.mark.asyncio
+async def test_extract_memory_awaits_memory_backend() -> None:
+    agent = Agent(telemetry=AgentTelemetry())
+    agent.messages = [{"role": "user", "content": "remember this"}]
+    extracted_messages: list[list[dict[str, str]]] = []
+
+    async def extract_memories(messages: list[dict[str, str]]) -> None:
+        extracted_messages.append(messages)
+
+    agent.memory = SimpleNamespace(extract_memories=extract_memories)
+
+    await agent.extract_memory()
+
+    assert extracted_messages == [agent.messages]
+
+
 @pytest.mark.asyncio
 async def test_agent_keeps_mcp_open_until_close(
     monkeypatch: pytest.MonkeyPatch,

@@ -37,6 +37,9 @@ approval, and telemetry behavior; tests should not require live services or real
 credentials. Add regression coverage for every behavior change. No numeric
 coverage threshold is configured, so prioritize meaningful branch coverage.
 
+Each newly add test function should be add simple comment under the func to describe
+the test scenario.
+
 ## Commit & Pull Request Guidelines
 
 The current history is minimal and uses short, sentence-case summaries (for
@@ -52,3 +55,7 @@ Copy `.env.example` to `.env` and set `LLM_API_KEY`, `LLM_BASE_URL`, and
 `LLM_MODEL_NAME`; never commit secrets. Treat `MCP_URL` and Phoenix tracing as
 optional integrations, and preserve approval checks around mutating or shell
 tools.
+
+## User Override
+
+If the user's instructions conflict with any rule in this document, ask for explicit confirmation before overriding. Only then execute their instructions.

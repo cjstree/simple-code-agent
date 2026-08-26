@@ -4,7 +4,7 @@ from pathlib import Path
 
 from openai import AsyncOpenAI
 
-from code_agent import settings
+from code_agent.settings import settings
 from code_agent.telemetry import AgentTelemetry
 
 

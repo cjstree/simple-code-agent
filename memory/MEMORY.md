@@ -1,2 +1,4 @@
 - [0]:[background_task_capability](background_task_capability.md) — The user wants to know if tasks can be run in the background.
-- [1]:[user_name](user_name.md) — The user's name is Jason.
+- [1]:[calculator_add_bug](calculator_add_bug.md) — The add function in calculator.py is buggy.
+- [2]:[do_not_modify_anything](do_not_modify_anything.md) — User instructed not to modify anything while analysing the problem.
+- [3]:[user_name](user_name.md) — The user's name is Jason.
