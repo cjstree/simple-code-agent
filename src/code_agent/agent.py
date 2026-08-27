@@ -12,11 +12,7 @@ from typing import Any
 import yaml
 from aioconsole import ainput
 from openai import AsyncOpenAI
-from openai.types.chat import (
-    ChatCompletionMessage,
-    ChatCompletionMessageFunctionToolCall,
-)
-from openai.types.chat.chat_completion_message_function_tool_call import Function
+from openai.types.chat import ChatCompletion
 
 from code_agent.background_manager import BackgroundManager
 from code_agent.context_manager import ContextManager
@@ -286,10 +282,11 @@ class Agent:
                 # await self.run(input=user_input)
                 with self.telemetry.trace_turn(
                     session_id=self.session_id, prompt=user_input
-                ):
+                ) as turn_span:
                     self.messages.append({"role": "user", "content": user_input})                   
                     await self.triggerHook("UsrPromptSubmit")
-                    await self._agent_loop(stream=True)
+                    completion = await self._agent_loop(stream=True)
+                    self._record_turn_completion(turn_span, completion)
 
         except (EOFError, KeyboardInterrupt):
             print(f"\n{DIM}Goodbye!{RESET}")
@@ -304,26 +301,45 @@ class Agent:
     ) -> str:
         if new_session:
             self.session_id = str(uuid.uuid4())
-        with self.telemetry.trace_turn(session_id=self.session_id, prompt=input):
+        with self.telemetry.trace_turn(
+            session_id=self.session_id, prompt=input
+        ) as turn_span:
             self.messages.append({"role": "user", "content": input})
             await self.triggerHook("UsrPromptSubmit")
             # TODO:simplify
             if stream:
-                await self._agent_loop(stream=True)
+                completion = await self._agent_loop(stream=True)
             else:
-                await self._agent_loop()
+                completion = await self._agent_loop()
+            self._record_turn_completion(turn_span, completion)
             return self.messages[-1]["content"]
 
+    def _record_turn_completion(
+        self, turn_span: Any, completion: ChatCompletion | None
+    ) -> None:
+        if completion is None or not completion.choices:
+            return
+        choice = completion.choices[0]
+        output = (
+            choice.message.content
+            if choice.message.content is not None
+            else rsp2msg(choice.message)
+        )
+        turn_span.set_output(output)
+        turn_span.set_attribute("agent.stop_reason", choice.finish_reason)
+
     # run agent loop.(Span)
-    async def _agent_loop(self, *, stream: bool = False):
+    async def _agent_loop(self, *, stream: bool = False) -> ChatCompletion:
         cur_round = 0
         while cur_round < self.max_tool_round:
             await self.triggerHook("PreLLMSubmit")
             # call the llm.
             if stream:
-                resp = await self._call_api(self.messages, stream=True)
+                completion = await self._call_api(self.messages, stream=True)
             else:
-                resp = await self._call_api(self.messages)
+                completion = await self._call_api(self.messages)
+            choice = completion.choices[0]
+            resp = choice.message
             self.messages.append(rsp2msg(resp))
             # print response content
             if resp.content and not stream:
@@ -384,6 +400,7 @@ class Agent:
         else :
             pass
             # stop because not more tool calls
+        return completion
 
     async def _ask_permission(self, tool_name: str) -> bool:
         decision = await ainput(
@@ -405,7 +422,7 @@ class Agent:
 
     async def _call_api(
         self, messages: list, *, stream: bool = False
-    ) -> ChatCompletionMessage:
+    ) -> ChatCompletion:
         openai_messages = messages
         request = {
             "model": settings.llm_model_name,
@@ -415,60 +432,27 @@ class Agent:
             "temperature": settings.llm_temperature,
         }
         if not stream:
-            completion = await self.client.chat.completions.create(**request)
-            return completion.choices[0].message
+            return await self.client.chat.completions.create(**request)
 
-        completion_stream = await self.client.chat.completions.create(
-            **request,
-            stream=True,
-        )
-        content_parts: list[str] = []
-        tool_calls: dict[int, dict[str, str]] = {}
         started_output = False
 
-        async for chunk in completion_stream:
-            if not chunk.choices:
-                continue
-            delta = chunk.choices[0].delta
-            if delta.content:
+        async with self.client.chat.completions.stream(
+            **request,
+            stream_options={"include_usage": True},
+        ) as completion_stream:
+            async for event in completion_stream:
+                if event.type != "content.delta":
+                    continue
                 if not started_output:
                     print(f"\n{CYAN}⏺{RESET} ", end="", flush=True)
                     started_output = True
-                print(delta.content, end="", flush=True)
-                content_parts.append(delta.content)
+                print(event.delta, end="", flush=True)
 
-            for tool_call in delta.tool_calls or []:
-                accumulated = tool_calls.setdefault(
-                    tool_call.index,
-                    {"id": "", "name": "", "arguments": ""},
-                )
-                if tool_call.id:
-                    accumulated["id"] += tool_call.id
-                if tool_call.function is not None:
-                    if tool_call.function.name:
-                        accumulated["name"] += tool_call.function.name
-                    if tool_call.function.arguments:
-                        accumulated["arguments"] += tool_call.function.arguments
+            completion = await completion_stream.get_final_completion()
 
         if started_output:
             print()
-
-        assembled_tool_calls = [
-            ChatCompletionMessageFunctionToolCall(
-                id=call["id"],
-                type="function",
-                function=Function(
-                    name=call["name"],
-                    arguments=call["arguments"],
-                ),
-            )
-            for _, call in sorted(tool_calls.items())
-        ]
-        return ChatCompletionMessage(
-            role="assistant",
-            content="".join(content_parts) or None,
-            tool_calls=assembled_tool_calls or None,
-        )
+        return completion
 
     async def build_system(self) -> None:
         # the first message must be system prompt!

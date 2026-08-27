@@ -142,22 +142,31 @@ class ContextManager:
             remaining = sum(size for size, _ in results_by_size)
             input_size = remaining
             persisted_count = 0
+            delta = []
 
             for size, index in results_by_size:
                 if remaining <= self.max_tool_round_res:
                     break
                 if size < self.persist_threshold:
                     break
+                original_content = messages[index]["content"]
                 compacted_content = self._persist_large_output(messages[index])
                 messages[index]["content"] = compacted_content
                 remaining -= size - len(compacted_content)
                 persisted_count += 1
+                delta.append(
+                    {
+                        "tool_call_id": messages[index]["tool_call_id"],
+                        "before": original_content,
+                        "after": compacted_content,
+                    }
+                )
 
             span.set_attribute("context.tool_result.count", len(results_by_size))
             span.set_attribute("context.tool_result.input_size", input_size)
             span.set_attribute("context.tool_result.output_size", remaining)
             span.set_attribute("context.tool_result.persisted_count", persisted_count)
-            span.set_output(messages)
+            span.set_output(delta)
             return messages
 
     # compact all history using llm, keep the sys prompt and the history summary

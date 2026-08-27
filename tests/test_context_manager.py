@@ -198,6 +198,7 @@ async def test_compact_uses_summary_after_context_limit_is_exceeded(
 def test_tool_res_compact_persists_largest_current_round_results(
     tmp_path, monkeypatch
 ) -> None:
+    # The compact trace reports only the persisted tool-result change.
     monkeypatch.chdir(tmp_path)
     telemetry = RecordingTelemetry()
     manager = ContextManager(
@@ -229,14 +230,25 @@ def test_tool_res_compact_persists_largest_current_round_results(
     assert span_kind == "chain"
     assert span.attributes["context.tool_result.count"] == 2
     assert span.attributes["context.tool_result.persisted_count"] == 1
-    assert span.output is messages
+    assert span.output == [
+        {
+            "tool_call_id": "large",
+            "before": large_content,
+            "after": messages[3]["content"],
+        }
+    ]
 
 
 def test_tool_res_compact_stops_when_remaining_results_are_below_threshold(
     tmp_path, monkeypatch
 ) -> None:
+    # A no-op compaction records an empty delta and leaves results unchanged.
     monkeypatch.chdir(tmp_path)
-    manager = ContextManager(object())
+    telemetry = RecordingTelemetry()
+    manager = ContextManager(
+        object(),
+        telemetry=telemetry,  # type: ignore[arg-type]
+    )
     manager.max_tool_round_res = 5
     manager.persist_threshold = 4
     messages = [tool_result("one", "abc"), tool_result("two", "def")]
@@ -245,6 +257,7 @@ def test_tool_res_compact_stops_when_remaining_results_are_below_threshold(
 
     assert [message["content"] for message in messages] == ["abc", "def"]
     assert not (tmp_path / "task_output").exists()
+    assert telemetry.operations[0][3].output == []
 
 
 def test_tool_res_compact_counts_persisted_placeholder_bytes(monkeypatch) -> None:

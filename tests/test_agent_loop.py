@@ -2,6 +2,18 @@ from types import SimpleNamespace
 from typing import Any, Self
 
 import pytest
+from openai.lib.streaming.chat import ChatCompletionStreamState
+from openai.types.chat import (
+    ChatCompletion,
+    ChatCompletionChunk,
+    ChatCompletionMessage,
+    ChatCompletionMessageFunctionToolCall,
+)
+from openai.types.chat.chat_completion import Choice
+from openai.types.chat.chat_completion_chunk import Choice as ChunkChoice
+from openai.types.chat.chat_completion_chunk import ChoiceDelta
+from openai.types.chat.chat_completion_message_function_tool_call import Function
+from openai.types.completion_usage import CompletionUsage
 
 from code_agent.agent import Agent
 from code_agent.context_manager import ContextManager
@@ -35,18 +47,77 @@ class FakeRegistry:
         return "result: 2"
 
 
-class FakeAsyncStream:
+class FakeChatCompletionStream:
     def __init__(self, *chunks: Any) -> None:
         self._chunks = iter(chunks)
+        self._state = ChatCompletionStreamState()
 
-    def __aiter__(self) -> "FakeAsyncStream":
+    async def __aenter__(self) -> Self:
         return self
 
-    async def __anext__(self) -> Any:
-        try:
-            return next(self._chunks)
-        except StopIteration as error:
-            raise StopAsyncIteration from error
+    async def __aexit__(self, exc_type, exc, traceback) -> None:
+        return None
+
+    async def __aiter__(self):
+        for chunk in self._chunks:
+            for event in self._state.handle_chunk(chunk):
+                yield event
+
+    async def get_final_completion(self) -> ChatCompletion:
+        return self._state.get_final_completion()
+
+
+def stream_chunk(
+    *,
+    delta: dict[str, Any] | None = None,
+    finish_reason: str | None = None,
+    usage: CompletionUsage | None = None,
+) -> ChatCompletionChunk:
+    choices = (
+        [
+            ChunkChoice(
+                delta=ChoiceDelta.model_validate(delta),
+                finish_reason=finish_reason,
+                index=0,
+            )
+        ]
+        if delta is not None
+        else []
+    )
+    return ChatCompletionChunk(
+        id="completion-1",
+        choices=choices,
+        created=123,
+        model="test-model",
+        object="chat.completion.chunk",
+        service_tier=None,
+        system_fingerprint="fingerprint-1",
+        usage=usage,
+    )
+
+
+def chat_completion(
+    message: ChatCompletionMessage, *, finish_reason: str
+) -> ChatCompletion:
+    return ChatCompletion(
+        id="completion-1",
+        choices=[Choice(index=0, message=message, finish_reason=finish_reason)],
+        created=123,
+        model="test-model",
+        object="chat.completion",
+    )
+
+
+class RecordingTurnSpan:
+    def __init__(self) -> None:
+        self.output: Any = None
+        self.attributes: dict[str, Any] = {}
+
+    def set_output(self, output: Any) -> None:
+        self.output = output
+
+    def set_attribute(self, key: str, value: Any) -> None:
+        self.attributes[key] = value
 
 
 @pytest.mark.asyncio
@@ -259,24 +330,29 @@ async def test_cli_loop_explicitly_enables_streaming(
 async def test_streaming_prints_raw_text_once_and_stores_complete_message(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    chunks = FakeAsyncStream(
-        SimpleNamespace(
-            choices=[
-                SimpleNamespace(delta=SimpleNamespace(content="**bo", tool_calls=None))
-            ]
+    # Streaming returns one standard completion while preserving terminal output.
+    completion_stream = FakeChatCompletionStream(
+        stream_chunk(
+            delta={"role": "assistant", "content": "**bo"},
         ),
-        SimpleNamespace(
-            choices=[
-                SimpleNamespace(delta=SimpleNamespace(content="ld**", tool_calls=None))
-            ]
+        stream_chunk(
+            delta={"content": "ld**"},
+            finish_reason="stop",
+        ),
+        stream_chunk(
+            usage=CompletionUsage(
+                completion_tokens=2,
+                prompt_tokens=3,
+                total_tokens=5,
+            ),
         ),
     )
     calls: list[dict[str, Any]] = []
 
     class FakeCompletions:
-        async def create(self, **kwargs: Any) -> FakeAsyncStream:
+        def stream(self, **kwargs: Any) -> FakeChatCompletionStream:
             calls.append(kwargs)
-            return chunks
+            return completion_stream
 
     agent = Agent(telemetry=AgentTelemetry())
     agent.client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
@@ -284,61 +360,51 @@ async def test_streaming_prints_raw_text_once_and_stores_complete_message(
     agent.messages = [{"role": "user", "content": "hello"}]
     agent.max_tool_round = 1
 
-    await agent._agent_loop(stream=True)
+    completion = await agent._agent_loop(stream=True)
 
     output = capsys.readouterr().out
     assert output.count("**bold**") == 1
     assert agent.messages[-1] == {"role": "assistant", "content": "**bold**"}
-    assert calls[0]["stream"] is True
+    assert calls[0]["stream_options"] == {"include_usage": True}
+    assert completion.choices[0].message.content == "**bold**"
+    assert completion.choices[0].finish_reason == "stop"
+    assert completion.usage is not None
+    assert completion.usage.total_tokens == 5
 
 
 @pytest.mark.asyncio
 async def test_streaming_reassembles_fragmented_tool_calls() -> None:
-    chunks = FakeAsyncStream(
-        SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    delta=SimpleNamespace(
-                        content=None,
-                        tool_calls=[
-                            SimpleNamespace(
-                                index=0,
-                                id="call-1",
-                                type="function",
-                                function=SimpleNamespace(
-                                    name="echo", arguments='{"val'
-                                ),
-                            )
-                        ],
-                    )
-                )
-            ]
+    # Fragmented tool-call deltas are assembled into a standard completion.
+    completion_stream = FakeChatCompletionStream(
+        stream_chunk(
+            delta={
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "echo", "arguments": '{"val'},
+                    }
+                ],
+            },
         ),
-        SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    delta=SimpleNamespace(
-                        content=None,
-                        tool_calls=[
-                            SimpleNamespace(
-                                index=0,
-                                id=None,
-                                type=None,
-                                function=SimpleNamespace(
-                                    name=None, arguments='ue": 2}'
-                                ),
-                            )
-                        ],
-                    )
-                )
-            ]
+        stream_chunk(
+            delta={
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "function": {"arguments": 'ue": 2}'},
+                    }
+                ],
+            },
+            finish_reason="tool_calls",
         ),
     )
 
     class FakeCompletions:
-        async def create(self, **kwargs: Any) -> FakeAsyncStream:
-            assert kwargs["stream"] is True
-            return chunks
+        def stream(self, **kwargs: Any) -> FakeChatCompletionStream:
+            return completion_stream
 
     agent = Agent(telemetry=AgentTelemetry())
     agent.client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
@@ -346,27 +412,37 @@ async def test_streaming_reassembles_fragmented_tool_calls() -> None:
 
     response = await agent._call_api([], stream=True)
 
-    assert response.content is None
-    assert response.tool_calls is not None
-    assert response.tool_calls[0].id == "call-1"
-    assert response.tool_calls[0].function.name == "echo"
-    assert response.tool_calls[0].function.arguments == '{"value": 2}'
+    message = response.choices[0].message
+    assert response.choices[0].finish_reason == "tool_calls"
+    assert message.content is None
+    assert message.tool_calls is not None
+    assert message.tool_calls[0].id == "call-1"
+    assert message.tool_calls[0].function.name == "echo"
+    assert message.tool_calls[0].function.arguments == '{"value": 2}'
 
 
 @pytest.mark.asyncio
 async def test_agent_completes_one_tool_call_cycle() -> None:
-    tool_call = SimpleNamespace(
+    tool_call = ChatCompletionMessageFunctionToolCall(
         id="call-1",
         type="function",
-        function=SimpleNamespace(
+        function=Function(
             name="echo",
             arguments='{"value": 2}',
         ),
     )
     responses = iter(
         [
-            SimpleNamespace(content=None, tool_calls=[tool_call]),
-            SimpleNamespace(content="finished", tool_calls=None),
+            chat_completion(
+                ChatCompletionMessage(
+                    role="assistant", content=None, tool_calls=[tool_call]
+                ),
+                finish_reason="tool_calls",
+            ),
+            chat_completion(
+                ChatCompletionMessage(role="assistant", content="finished"),
+                finish_reason="stop",
+            ),
         ]
     )
 
@@ -399,6 +475,44 @@ async def test_agent_completes_one_tool_call_cycle() -> None:
         "content": "result: 2",
     }
     assert agent.messages[-1]["content"] == "finished"
+
+
+@pytest.mark.parametrize("finish_reason", ["stop", "length", "content_filter"])
+def test_record_turn_completion_uses_provider_finish_reason(
+    finish_reason: str,
+) -> None:
+    # Turn output and stop reason come directly from the final completion choice.
+    agent = Agent(telemetry=AgentTelemetry())
+    span = RecordingTurnSpan()
+    completion = chat_completion(
+        ChatCompletionMessage(role="assistant", content="final answer"),
+        finish_reason=finish_reason,
+    )
+
+    agent._record_turn_completion(span, completion)
+
+    assert span.output == "final answer"
+    assert span.attributes == {"agent.stop_reason": finish_reason}
+
+
+def test_record_turn_completion_uses_tool_call_message_as_output() -> None:
+    # A tool-only terminal completion still produces a meaningful turn output.
+    agent = Agent(telemetry=AgentTelemetry())
+    span = RecordingTurnSpan()
+    tool_call = ChatCompletionMessageFunctionToolCall(
+        id="call-1",
+        type="function",
+        function=Function(name="echo", arguments="{}"),
+    )
+    completion = chat_completion(
+        ChatCompletionMessage(role="assistant", content=None, tool_calls=[tool_call]),
+        finish_reason="tool_calls",
+    )
+
+    agent._record_turn_completion(span, completion)
+
+    assert span.output["tool_calls"][0]["id"] == "call-1"
+    assert span.attributes == {"agent.stop_reason": "tool_calls"}
 
 
 @pytest.mark.asyncio
