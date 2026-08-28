@@ -16,7 +16,7 @@ from openai.types.chat.chat_completion_message_function_tool_call import Functio
 from openai.types.completion_usage import CompletionUsage
 
 from code_agent.agent import Agent
-from code_agent.context_manager import ContextManager
+from code_agent.session import Session
 from code_agent.settings import settings
 from code_agent.telemetry import AgentTelemetry
 
@@ -97,7 +97,10 @@ def stream_chunk(
 
 
 def chat_completion(
-    message: ChatCompletionMessage, *, finish_reason: str
+    message: ChatCompletionMessage,
+    *,
+    finish_reason: str,
+    usage: CompletionUsage | None = None,
 ) -> ChatCompletion:
     return ChatCompletion(
         id="completion-1",
@@ -105,6 +108,7 @@ def chat_completion(
         created=123,
         model="test-model",
         object="chat.completion",
+        usage=usage,
     )
 
 
@@ -174,10 +178,15 @@ async def test_agent_run_can_be_called_without_cli_loop(
     monkeypatch.setattr(settings, "mcp_url", None)
     agent = Agent(telemetry=AgentTelemetry(), system_prompt="test system")
     loop_calls = 0
+    completion = chat_completion(
+        ChatCompletionMessage(role="assistant", content="finished"),
+        finish_reason="stop",
+    )
 
-    async def fake_agent_loop() -> None:
+    async def fake_agent_loop() -> ChatCompletion:
         nonlocal loop_calls
         loop_calls += 1
+        return completion
 
     try:
         await agent.start()
@@ -185,12 +194,69 @@ async def test_agent_run_can_be_called_without_cli_loop(
 
         result = await agent.run("hello")
 
-        assert result is not None
+        assert result == "finished"
         assert loop_calls == 1
-        assert agent.messages == [
+        assert agent.session is not None
+        assert agent.session.build_context() == [
             {"role": "system", "content": "test system"},
             {"role": "user", "content": "hello"},
         ]
+    finally:
+        await agent.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_uses_session_for_request_and_response_messages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A started agent stores both sides of a turn in Session-built context.
+    monkeypatch.setattr(settings, "llm_api_key", "test-key")
+    monkeypatch.setattr(settings, "llm_model_name", "test-model")
+    monkeypatch.setattr(settings, "mcp_url", None)
+    agent = Agent(telemetry=AgentTelemetry(), system_prompt="test system")
+    completion = chat_completion(
+        ChatCompletionMessage(role="assistant", content="finished"),
+        finish_reason="stop",
+        usage=CompletionUsage(
+            completion_tokens=2,
+            prompt_tokens=3,
+            total_tokens=5,
+        ),
+    )
+    request_contexts: list[list[dict[str, Any]]] = []
+
+    async def call_api(messages: list[dict[str, Any]]) -> ChatCompletion:
+        request_contexts.append(messages)
+        return completion
+
+    async def extract_memories(messages: list[dict[str, Any]]) -> None:
+        return None
+
+    try:
+        await agent.start()
+        agent.memory = SimpleNamespace(extract_memories=extract_memories)
+        monkeypatch.setattr(agent, "_call_api", call_api)
+
+        result = await agent.run("hello")
+
+        assert result == "finished"
+        assert request_contexts == [
+            [
+                {"role": "system", "content": "test system"},
+                {"role": "user", "content": "hello"},
+            ]
+        ]
+        assert agent.session is not None
+        assert [entry.role for entry in agent.session.entrys] == [
+            "user",
+            "assistant",
+        ]
+        assert not hasattr(agent, "messages")
+        assert agent.session.build_context()[-1] == {
+            "role": "assistant",
+            "content": "finished",
+        }
+        assert agent.session.context_token == 5
     finally:
         await agent.close()
 
@@ -205,9 +271,13 @@ async def test_agent_run_can_reuse_or_create_session(
     monkeypatch.setattr(settings, "llm_model_name", "test-model")
     monkeypatch.setattr(settings, "mcp_url", None)
     agent = Agent(telemetry=AgentTelemetry(), system_prompt="test system")
+    completion = chat_completion(
+        ChatCompletionMessage(role="assistant", content="finished"),
+        finish_reason="stop",
+    )
 
-    async def fake_agent_loop() -> None:
-        return None
+    async def fake_agent_loop() -> ChatCompletion:
+        return completion
 
     try:
         await agent.start()
@@ -229,7 +299,11 @@ async def test_agent_run_can_reuse_or_create_session(
 @pytest.mark.asyncio
 async def test_extract_memory_awaits_memory_backend() -> None:
     agent = Agent(telemetry=AgentTelemetry())
-    agent.messages = [{"role": "user", "content": "remember this"}]
+    agent.session = Session(
+        sys_prompt="test system",
+        client=object(),  # type: ignore[arg-type]
+    )
+    agent.session.append_message({"role": "user", "content": "remember this"})
     extracted_messages: list[list[dict[str, str]]] = []
 
     async def extract_memories(messages: list[dict[str, str]]) -> None:
@@ -239,7 +313,7 @@ async def test_extract_memory_awaits_memory_backend() -> None:
 
     await agent.extract_memory()
 
-    assert extracted_messages == [agent.messages]
+    assert extracted_messages == [agent.session.build_context()]
 
 
 @pytest.mark.asyncio
@@ -319,6 +393,10 @@ async def test_cli_loop_explicitly_enables_streaming(
 
     monkeypatch.setattr("code_agent.agent.ainput", fake_input)
     agent = Agent(telemetry=AgentTelemetry())
+    agent.session = Session(
+        sys_prompt="test system",
+        client=object(),  # type: ignore[arg-type]
+    )
     monkeypatch.setattr(agent, "_agent_loop", fake_agent_loop)
 
     await agent.cli_loop()
@@ -357,14 +435,21 @@ async def test_streaming_prints_raw_text_once_and_stores_complete_message(
     agent = Agent(telemetry=AgentTelemetry())
     agent.client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
     agent.tool_registry = FakeRegistry()  # type: ignore[assignment]
-    agent.messages = [{"role": "user", "content": "hello"}]
+    agent.session = Session(
+        sys_prompt="test system",
+        client=agent.client,  # type: ignore[arg-type]
+    )
+    agent.session.append_message({"role": "user", "content": "hello"})
     agent.max_tool_round = 1
 
     completion = await agent._agent_loop(stream=True)
 
     output = capsys.readouterr().out
     assert output.count("**bold**") == 1
-    assert agent.messages[-1] == {"role": "assistant", "content": "**bold**"}
+    assert agent.session.build_context()[-1] == {
+        "role": "assistant",
+        "content": "**bold**",
+    }
     assert calls[0]["stream_options"] == {"include_usage": True}
     assert completion.choices[0].message.content == "**bold**"
     assert completion.choices[0].finish_reason == "stop"
@@ -449,9 +534,14 @@ async def test_agent_completes_one_tool_call_cycle() -> None:
     agent = Agent(telemetry=AgentTelemetry())
     registry = FakeRegistry()
     agent.tool_registry = registry  # type: ignore[assignment]
-    agent.context_manager = ContextManager(object())
-    agent.messages = [{"role": "user", "content": "run the tool"}]
     agent.system_prompt = "test"
+    agent.session = Session(
+        sys_prompt=agent.system_prompt,
+        client=object(),  # type: ignore[arg-type]
+    )
+    agent.session.append_message(
+        {"role": "user", "content": "run the tool"}
+    )
     agent.max_tool_round = 3
 
     async def call_api(messages: list[dict[str, Any]]) -> Any:
@@ -462,19 +552,21 @@ async def test_agent_completes_one_tool_call_cycle() -> None:
     await agent._agent_loop()
 
     assert registry.calls == [("echo", {"value": 2})]
-    assert [message["role"] for message in agent.messages] == [
+    messages = agent.session.build_context()
+    assert [message["role"] for message in messages] == [
+        "system",
         "user",
         "assistant",
         "tool",
         "assistant",
     ]
-    assert agent.messages[1]["tool_calls"][0]["id"] == "call-1"
-    assert agent.messages[2] == {
+    assert messages[2]["tool_calls"][0]["id"] == "call-1"
+    assert messages[3] == {
         "role": "tool",
         "tool_call_id": "call-1",
         "content": "result: 2",
     }
-    assert agent.messages[-1]["content"] == "finished"
+    assert messages[-1]["content"] == "finished"
 
 
 @pytest.mark.parametrize("finish_reason", ["stop", "length", "content_filter"])

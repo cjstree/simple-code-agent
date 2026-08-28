@@ -153,9 +153,23 @@ class Session:
                 messages.append(message)
         return messages
 
+    async def compact(self) -> None:
+        self._micro_compact()
+        await self.compact_history()
+
+    def update_sys_prompt(self,new_sys : str) :
+        self.system_prompt = new_sys
+
     # may discard useful read-file result.
+    # Prefer keeping the newest max_tool_res results. Older short results may stay
+    # unchanged, so max_tool_res is not a hard cap on the number of tool messages.
     def _micro_compact(self) -> None:
-        """Compact older, large tool results in the active window."""
+        """
+        Compact older, large tool results in the active window.
+        may discard useful read-file result.
+        Prefer keeping the newest max_tool_res results. Older short results may stay
+        unchanged, so max_tool_res is not a hard cap on the number of tool messages
+        """
         active_entries = self.entrys[self.check_point:]
         remaining_tool_results = sum(
             isinstance(entry, MessageEntry) and entry.role == "tool"
@@ -182,7 +196,7 @@ class Session:
                 )
             remaining_tool_results -= 1
 
-    def _tool_res_compact(self) -> None:
+    def tool_res_compact(self) -> None:
         """Persist oversized results from the latest active tool-call round."""
         active_entries = self.entrys[self.check_point:]
         round_start = len(active_entries)
