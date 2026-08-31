@@ -1,0 +1,13 @@
+diff --git a/cache.py b/cache.py
+--- a/cache.py
++++ b/cache.py
+@@ -15,6 +15,7 @@ class Cache:
+         entry = self._entries.get(key)
+         if entry is None:
+             return None
+-        if entry.expires_at < self._clock():
+-            return entry.value
++        if entry.expires_at <= self._clock():
++            self._entries.pop(key, None)
++            return None
+         return entry.value

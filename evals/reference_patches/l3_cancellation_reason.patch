@@ -1,0 +1,59 @@
+diff --git a/order_api.py b/order_api.py
+--- a/order_api.py
++++ b/order_api.py
+@@ -4,5 +4,5 @@ from order_service import OrderService
+ 
+ 
+ def cancel_order(payload: dict[str, str], service: OrderService) -> dict[str, str]:
+-    cancelled = service.cancel(payload["order_id"])
++    cancelled = service.cancel(payload["order_id"], payload["reason"])
+     return asdict(cancelled)
+diff --git a/order_models.py b/order_models.py
+--- a/order_models.py
++++ b/order_models.py
+@@ -5,3 +5,4 @@ from dataclasses import dataclass
+ class Order:
+     order_id: str
+     status: str
++    cancellation_reason: str | None = None
+diff --git a/order_repository.py b/order_repository.py
+--- a/order_repository.py
++++ b/order_repository.py
+@@ -10,6 +10,7 @@ class OrderRepository:
+         self._records[order.order_id] = {
+             "order_id": order.order_id,
+             "status": order.status,
++            "cancellation_reason": order.cancellation_reason,
+         }
+ 
+     def get(self, order_id: str) -> Order | None:
+@@ -17,4 +18,8 @@ class OrderRepository:
+         record = self._records.get(order_id)
+         if record is None:
+             return None
+-        return Order(order_id=record["order_id"], status=record["status"])
++        return Order(
++            order_id=record["order_id"],
++            status=record["status"],
++            cancellation_reason=record.get("cancellation_reason"),
++        )
+diff --git a/order_service.py b/order_service.py
+--- a/order_service.py
++++ b/order_service.py
+@@ -7,10 +7,14 @@ class OrderService:
+     def __init__(self, repository: OrderRepository) -> None:
+         self._repository = repository
+ 
+-    def cancel(self, order_id: str) -> Order:
++    def cancel(self, order_id: str, reason: str) -> Order:
+         order = self._repository.get(order_id)
+         if order is None:
+             raise KeyError(order_id)
+-        cancelled = Order(order_id=order.order_id, status="cancelled")
++        cancelled = Order(
++            order_id=order.order_id,
++            status="cancelled",
++            cancellation_reason=reason,
++        )
+         self._repository.save(cancelled)
+         return cancelled

@@ -179,3 +179,6 @@ cython_debug/
 
 # Memory
 memory/*
+
+# test result
+artifacts/*

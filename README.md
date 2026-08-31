@@ -58,12 +58,12 @@ uv run python -m pytest tests/test_skills.py -q
 ## Inspect 文件修改评测
 
 文件修改评测定义在 `src/code_agent_evals/`，样例清单位于
-`dataset/file_edit.jsonl`，样例的初始文件位于 `dataset/fixtures/`。
+`evals/file_edit.jsonl`，样例的初始文件位于 `evals/fixtures/`。
 
 评测使用 Inspect `local` sandbox。每个样例运行时，Inspect 会创建独立的
 临时目录，将样例文件复制到该目录，以该目录作为工作目录启动 Agent，最后在
 同一目录运行 pytest。样例结束后临时目录会被删除，因此 Agent 不会修改
-`dataset/fixtures/` 中的原始文件。
+`evals/fixtures/` 中的原始文件。
 
 `local` sandbox 只提供独立临时工作目录，不是安全边界。Agent 执行的命令仍然
 运行在宿主机上，这套配置只用于可信的轻量端到端测试。
@@ -90,23 +90,24 @@ token 配置和 Phoenix telemetry 均由 Agent 自己负责。
 每个样例使用一个独立目录，目录名建议与 sample ID 一致：
 
 ```text
-dataset/
+evals/
 ├── file_edit.jsonl
-└── fixtures/
-    └── fix_multiply_with_context/
-        ├── calculator.py
-        ├── tests/
-        │   └── test_calculator.py
-        ├── skills/
-        │   └── arithmetic-fix/
-        │       └── SKILL.md
-        └── memory/
-            ├── MEMORY.md
-            └── project-arithmetic.md
+├── fixtures/
+│   └── l2_expired_cache/
+│       ├── cache.py
+│       ├── models.py
+│       ├── service.py
+│       └── tests/
+│           └── test_cache.py
+└── hidden_tests/
+    └── l2_expired_cache/
+        └── test_cache_regression.py
 ```
 
 源码和 `tests/` 是常规样例内容。`skills/` 和 `memory/` 是可选目录；由于
 Agent 在样例根目录启动，现有逻辑会自动扫描 `./skills` 并读取 `./memory`。
+`hidden_tests/` 不包含在 sample 的 `files` 映射中。Agent 完成后，scorer 才把
+对应目录复制为 sandbox 内的 `.eval_hidden_tests/`。
 
 Skill 使用 Agent 当前支持的 frontmatter 格式：
 
@@ -139,7 +140,7 @@ Memory content used by the Agent.
 
 ### 在 JSONL 中注册样例
 
-在 `dataset/file_edit.jsonl` 追加一行 JSON：
+在 `evals/file_edit.jsonl` 追加一行 JSON：
 
 ```json
 {"id":"fix_example","input":"Fix the implementation and run the tests.","target":"","files":{".":"fixtures/fix_example"}}
@@ -149,12 +150,35 @@ Memory content used by the Agent.
 Agent 和消息历史；`agent_config` 可以降低 eval 中的 compact 阈值：
 
 ```json
-{"id":"compact_example","input":"Complete the multi-turn task.","target":"","metadata":{"turns":["Inspect the implementation; do not edit yet.","Preserve the public API.","Now fix it and run the tests."],"agent_config":{"max_messages":8,"context_limit":2000}},"files":{".":"fixtures/compact_example"}}
+{"id":"compact_example","input":"Complete the multi-turn task.","target":"","metadata":{"turns":["Inspect the implementation; do not edit yet.","Preserve the public API.","Now fix it and run the tests."],"agent_config":{"compact_thresh_hold":2000}},"files":{".":"fixtures/compact_example"}}
 ```
 
-`agent_config` 仅支持 `context_limit`、`max_messages`、`max_tool_res`、
-`max_tool_round_res` 和 `persist_threshold`，值必须为正整数。省略
-`metadata.turns` 时，runner 仍将 `input` 作为单轮任务执行。
+`agent_config` 仅支持 `compact_thresh_hold`、`max_tool_res`、
+`max_tool_round_res`、`persist_threshold` 和 `reserved_token`，值必须为正整数。
+省略 `metadata.turns` 时，runner 仍将 `input` 作为单轮任务执行。
+
+mini-SWE 样例还要定义行为级测试契约：
+
+```json
+{
+  "metadata": {
+    "level": "L2",
+    "regression_purpose": "Expired entries must behave as cache misses.",
+    "FAIL_TO_PASS": [
+      "tests/test_cache.py::test_expired_profile_is_a_cache_miss",
+      ".eval_hidden_tests/test_cache_regression.py::test_entry_expiring_now_is_a_cache_miss"
+    ],
+    "PASS_TO_PASS": [
+      "tests/test_cache.py::test_live_profile_is_returned",
+      ".eval_hidden_tests/test_cache_regression.py::test_missing_and_unrelated_live_entries_keep_their_behavior"
+    ]
+  }
+}
+```
+
+`FAIL_TO_PASS` 是原始实现失败、修复后必须通过的行为；`PASS_TO_PASS` 是修复前后
+都必须通过的兼容行为。两组都必须非空、不能重叠，并且只能引用 `tests/` 或
+`.eval_hidden_tests/` 下的 pytest node ID。最终得分是两组结果的逻辑与。
 
 字段含义：
 
@@ -162,23 +186,28 @@ Agent 和消息历史；`agent_config` 可以降低 eval 中的 compact 阈值�
 - `input`：提交给 Agent 的任务描述。
 - `metadata.turns`：可选的连续用户回合；同一样例内共享 Agent 状态。
 - `metadata.agent_config`：可选的 eval 专用 ContextManager 阈值。
+- `metadata.level`：case 难度，例如 `L2` 或 `L3`。
+- `metadata.reference_patch`：用于验证 case 可解性和变更层级的参考补丁；不参与评分。
+- `metadata.regression_purpose`：case 覆盖的行为和回归目的。
+- `metadata.FAIL_TO_PASS`：原始实现失败、修复后应通过的测试清单。
+- `metadata.PASS_TO_PASS`：原始实现及修复后都应通过的测试清单。
 - `target`：当前 pytest scorer 不使用文本 target，可以保留为空字符串。
 - `files`：sandbox 目标路径到源文件或目录的映射。
 - `files` 中的 `"."` 表示把 fixture 目录内容复制到样例工作目录根部。
-- fixture 路径相对于 `dataset/file_edit.jsonl` 所在目录解析。
+- fixture 路径相对于 `evals/file_edit.jsonl` 所在目录解析。
 
 构造新样例的推荐步骤：
 
-1. 在 `dataset/fixtures/<sample-id>/` 创建一份最小项目。
-2. 放入带有明确错误的实现和能够暴露该错误的 pytest 测试。
-3. 如有需要，添加 `skills/<skill-name>/SKILL.md`。
-4. 如有需要，添加 `memory/MEMORY.md` 及其引用的 memory 文件。
-5. 在 `dataset/file_edit.jsonl` 追加对应 JSON 记录。
+1. 在 `evals/fixtures/<sample-id>/` 创建一份最小项目和 visible tests。
+2. 在 `evals/hidden_tests/<sample-id>/` 添加同一 specification 的回归测试。
+3. 在原始 fixture 上确认每个 `FAIL_TO_PASS` 失败、每个 `PASS_TO_PASS` 通过。
+4. 在 `evals/file_edit.jsonl` 注册稳定 ID、输入、level、回归目的和测试清单。
+5. 在 `evals/reference_patches/` 添加 reference fix，并确认两组测试全部通过。
 6. 使用 `--sample-id <sample-id>` 单独运行并检查结果。
 
 不要把密钥、真实用户 memory 或依赖外部服务的测试放进 fixture。测试应当可重复，
-且不依赖 Agent 最终回答的措辞；当前 scorer 通过 `python -m pytest -q` 的退出状态
-评分。
+且不依赖 Agent 最终回答的措辞。旧样例仍执行整个 pytest suite；带测试契约的
+mini-SWE 样例按 `FAIL_TO_PASS` 和 `PASS_TO_PASS` 的外部可观察结果评分。
 
 ### 启动评测
 
