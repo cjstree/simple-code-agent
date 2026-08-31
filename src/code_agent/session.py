@@ -5,9 +5,9 @@ from typing import Any
 
 from openai import AsyncOpenAI
 from openai.types import CompletionUsage
-from code_agent.telemetry import AgentTelemetry
-from code_agent.settings import settings
 
+from code_agent.settings import settings
+from code_agent.telemetry import AgentTelemetry
 
 SUMMARIZER_SYS_PROMPT = (
     "You are a technical Summarizer for Coding Sessionst. Your task is to summarize the conversation"
@@ -154,16 +154,30 @@ class Session:
         return messages
 
     async def compact(self) -> None:
-        self._micro_compact()
-        await self.compact_history()
+        context_before = self.build_context()
+        with self.telemetry.trace_operation(
+            name="session.compact",
+            span_kind="chain",
+            input_value={"active_message_count": len(context_before)},
+        ) as span:
+            micro_changed = self._micro_compact()
+            history_changed = await self.compact_history()
+            if not (micro_changed or history_changed):
+                span.set_output({"active_context_changed": False})
+            else:
+                span.set_output(
+                    {
+                        "active_context_changed": True,
+                        "before": context_before,
+                        "after": self.build_context(),
+                    }
+                )
 
     def update_sys_prompt(self,new_sys : str) :
         self.system_prompt = new_sys
 
-    # may discard useful read-file result.
-    # Prefer keeping the newest max_tool_res results. Older short results may stay
-    # unchanged, so max_tool_res is not a hard cap on the number of tool messages.
-    def _micro_compact(self) -> None:
+
+    def _micro_compact(self) -> bool:
         """
         Compact older, large tool results in the active window.
         may discard useful read-file result.
@@ -175,7 +189,7 @@ class Session:
             isinstance(entry, MessageEntry) and entry.role == "tool"
             for entry in active_entries
         )
-
+        changed = False
         for entry in active_entries:
             if remaining_tool_results <= self.max_tool_res:
                 break
@@ -194,9 +208,11 @@ class Session:
                     "parameters if needed.\n"
                     "</tool-result-truncated>"
                 )
+                changed = True
             remaining_tool_results -= 1
+        return changed
 
-    def tool_res_compact(self) -> None:
+    def tool_res_compact(self) -> bool:
         """Persist oversized results from the latest active tool-call round."""
         active_entries = self.entrys[self.check_point:]
         round_start = len(active_entries)
@@ -222,6 +238,7 @@ class Session:
         )
 
         remaining = sum(size for size, _, _, _ in results_by_size)
+        changed = False
         for size, _, entry, content in results_by_size:
             if remaining <= self.max_tool_round_res:
                 break
@@ -231,6 +248,8 @@ class Session:
             compacted_content = self._persist_large_output(entry, content)
             entry.replace_content = compacted_content
             remaining -= size - len(compacted_content)
+            changed = changed or compacted_content != content
+        return changed
 
     def _persist_large_output(self, entry: MessageEntry, content: str) -> str:
         output_dir = Path("task_output/tool_results")
@@ -266,9 +285,9 @@ class Session:
         return self.context_token + self.reserved_token >= self.compact_thresh_hold
 
     # TODO: avoid split tool_call and tool_result
-    async def compact_history(self):
+    async def compact_history(self) -> bool:
         if not self.need_compact():
-            return
+            return False
 
         # Token count of the active context that will be replaced by the summary.
         token_before_compact = self.context_token
@@ -279,13 +298,19 @@ class Session:
         context_json = json.dumps(context,ensure_ascii=False)
         openai_message = [{"role":"system","content":SUMMARIZER_SYS_PROMPT},
                           {"role": "user", "content": f"Please summarize the history :{context_json}"}]
-        completion = await self.client.chat.completions.create(
-            model=settings.llm_model_name,
-            messages=openai_message,
-            max_tokens=settings.llm_max_tokens,
-            temperature=settings.llm_temperature,
-        )
-        summary = completion.choices[0].message.content
+        with self.telemetry.trace_operation(
+            name="session.compact_history",
+            span_kind="chain",
+            input_value={"context_token": token_before_compact},
+        ) as span:
+            completion = await self.client.chat.completions.create(
+                model=settings.llm_model_name,
+                messages=openai_message,
+                max_tokens=settings.llm_max_tokens,
+                temperature=settings.llm_temperature,
+            )
+            summary = completion.choices[0].message.content
+            span.set_output(summary)
 
         # Actual tokens generated for the summary text.
         summary_token = completion.usage.completion_tokens
@@ -308,3 +333,4 @@ class Session:
         self.check_point = entry.seq
         self.next_seq += 1
         self.context_token = compacted_context_token
+        return True

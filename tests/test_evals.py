@@ -46,6 +46,7 @@ def test_context_fixture_includes_skills_and_memory() -> None:
 # A multi-turn sample carries ordered prompts and compact thresholds in metadata.
 # Parsing preserves both so the runner can reuse one Agent for every turn.
 def test_multiturn_eval_payload_is_available_to_runner() -> None:
+    # The compact sample preserves its turns and Session-specific threshold.
     task = basic_agent_eval()
     samples = {sample.id: sample for sample in task.dataset}
     sample = samples["fix_add_multiturn_compact"]
@@ -61,36 +62,46 @@ def test_multiturn_eval_payload_is_available_to_runner() -> None:
 
     assert len(turns) == 3
     assert turns[-1] == "Now fix the implementation and run the tests."
-    assert config == {"max_messages": 8, "context_limit": 500}
+    assert config == {"compact_thresh_hold": 500}
 
 
 # Existing single-prompt callers remain valid while context settings are
 # restricted to the allowlisted evaluation thresholds.
-def test_runner_accepts_legacy_prompt_and_applies_context_config() -> None:
+def test_runner_accepts_legacy_prompt_and_applies_session_config() -> None:
+    # Legacy prompts still work and eval thresholds configure the Session.
     assert parse_payload("plain prompt") == (["plain prompt"], {})
     assert parse_payload('"JSON-shaped prompt"') == (['"JSON-shaped prompt"'], {})
-    context_manager = SimpleNamespace(context_limit=100_000)
-    agent = SimpleNamespace(context_manager=context_manager)
+    session = SimpleNamespace(compact_thresh_hold=128_000)
+    agent = SimpleNamespace(session=session)
 
-    apply_agent_config(agent, {"context_limit": 2_000})
+    apply_agent_config(agent, {"compact_thresh_hold": 2_000})
 
-    assert context_manager.context_limit == 2_000
+    assert session.compact_thresh_hold == 2_000
+
+
+def test_runner_rejects_obsolete_context_manager_config() -> None:
+    # Eval config must not silently target the retired context manager.
+    payload = json.dumps({"turns": ["first"], "agent_config": {"context_limit": 500}})
+
+    with pytest.raises(ValueError, match="unsupported agent_config fields"):
+        parse_payload(payload)
 
 
 # The solver uses the sample input for legacy records and forwards explicit
 # turns and context thresholds when metadata supplies them.
 def test_solver_serializes_multiturn_runner_payload() -> None:
+    # Solver metadata is forwarded unchanged to the subprocess runner.
     state = SimpleNamespace(
         input_text="fallback",
         metadata={
             "turns": ["first", "second"],
-            "agent_config": {"max_messages": 6},
+            "agent_config": {"compact_thresh_hold": 600},
         },
     )
 
     assert json.loads(_runner_payload(state)) == {
         "turns": ["first", "second"],
-        "agent_config": {"max_messages": 6},
+        "agent_config": {"compact_thresh_hold": 600},
     }
 
 
@@ -130,12 +141,13 @@ async def test_solver_runs_agent_without_bridge_or_llm_overrides(monkeypatch) ->
 # final response is returned only after the shared Agent is closed.
 @pytest.mark.asyncio
 async def test_runner_executes_turns_in_one_agent_session(monkeypatch) -> None:
+    # All turns share one Agent Session configured before the first turn.
     agents = []
 
     class FakeAgent:
         def __init__(self, telemetry) -> None:
             self.telemetry = telemetry
-            self.context_manager = SimpleNamespace(context_limit=100_000)
+            self.session = SimpleNamespace(compact_thresh_hold=128_000)
             self.calls: list[tuple[str, bool]] = []
             self.closed = False
             agents.append(self)
@@ -158,7 +170,9 @@ async def test_runner_executes_turns_in_one_agent_session(monkeypatch) -> None:
         SimpleNamespace(initialize=lambda **kwargs: telemetry),
     )
 
-    result = await runner.run(["first", "second", "third"], {"context_limit": 500})
+    result = await runner.run(
+        ["first", "second", "third"], {"compact_thresh_hold": 500}
+    )
 
     assert result == "answer: third"
     assert agents[0].calls == [
@@ -166,5 +180,5 @@ async def test_runner_executes_turns_in_one_agent_session(monkeypatch) -> None:
         ("second", False),
         ("third", False),
     ]
-    assert agents[0].context_manager.context_limit == 500
+    assert agents[0].session.compact_thresh_hold == 500
     assert agents[0].closed is True

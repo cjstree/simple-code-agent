@@ -9,12 +9,12 @@ from code_agent.agent import Agent
 from code_agent.settings import settings
 from code_agent.telemetry import AgentTelemetry
 
-_CONTEXT_CONFIG_FIELDS = {
-    "context_limit",
-    "max_messages",
+_SESSION_CONFIG_FIELDS = {
+    "compact_thresh_hold",
     "max_tool_res",
     "max_tool_round_res",
     "persist_threshold",
+    "reserved_token",
 }
 
 
@@ -40,7 +40,7 @@ def parse_payload(raw: str) -> tuple[list[str], dict[str, int]]:
     if not isinstance(raw_config, dict):
         raise TypeError("evaluation payload agent_config must be an object")
 
-    unknown_fields = set(raw_config) - _CONTEXT_CONFIG_FIELDS
+    unknown_fields = set(raw_config) - _SESSION_CONFIG_FIELDS
     if unknown_fields:
         fields = ", ".join(sorted(unknown_fields))
         raise ValueError(f"unsupported agent_config fields: {fields}")
@@ -55,9 +55,9 @@ def parse_payload(raw: str) -> tuple[list[str], dict[str, int]]:
 
 
 def apply_agent_config(agent: Agent, config: dict[str, int]) -> None:
-    """Apply the allowlisted evaluation thresholds to the context manager."""
+    """Apply the allowlisted evaluation thresholds to the active session."""
     for name, value in config.items():
-        setattr(agent.context_manager, name, value)
+        setattr(agent.session, name, value)
 
 
 async def run(turns: list[str], agent_config: dict[str, int]) -> str:
