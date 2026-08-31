@@ -12,7 +12,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 @task
 def basic_agent_eval():
     return Task(
-        dataset=json_dataset(str(_PROJECT_ROOT / "dataset/file_edit.jsonl")),
+        dataset=json_dataset(str(_PROJECT_ROOT / "evals/file_edit.jsonl")),
         solver=my_agent_solver(),
         scorer=tests_pass(),
         sandbox="local",

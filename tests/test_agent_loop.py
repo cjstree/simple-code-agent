@@ -2,7 +2,6 @@ from types import SimpleNamespace
 from typing import Any, Self
 
 import pytest
-from openai.lib.streaming.chat import ChatCompletionStreamState
 from openai.types.chat import (
     ChatCompletion,
     ChatCompletionChunk,
@@ -50,7 +49,6 @@ class FakeRegistry:
 class FakeChatCompletionStream:
     def __init__(self, *chunks: Any) -> None:
         self._chunks = iter(chunks)
-        self._state = ChatCompletionStreamState()
 
     async def __aenter__(self) -> Self:
         return self
@@ -60,11 +58,7 @@ class FakeChatCompletionStream:
 
     async def __aiter__(self):
         for chunk in self._chunks:
-            for event in self._state.handle_chunk(chunk):
-                yield event
-
-    async def get_final_completion(self) -> ChatCompletion:
-        return self._state.get_final_completion()
+            yield chunk
 
 
 def stream_chunk(
@@ -428,13 +422,25 @@ async def test_streaming_prints_raw_text_once_and_stores_complete_message(
     calls: list[dict[str, Any]] = []
 
     class FakeCompletions:
-        def stream(self, **kwargs: Any) -> FakeChatCompletionStream:
+        async def create(self, **kwargs: Any) -> FakeChatCompletionStream:
             calls.append(kwargs)
             return completion_stream
 
     agent = Agent(telemetry=AgentTelemetry())
     agent.client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
-    agent.tool_registry = FakeRegistry()  # type: ignore[assignment]
+    non_strict_tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "read",
+                "description": "Read a file",
+                "parameters": {"type": "object"},
+            },
+        }
+    ]
+    agent.tool_registry = SimpleNamespace(
+        get_tools_desc=lambda: non_strict_tools
+    )
     agent.session = Session(
         sys_prompt="test system",
         client=agent.client,  # type: ignore[arg-type]
@@ -451,6 +457,8 @@ async def test_streaming_prints_raw_text_once_and_stores_complete_message(
         "content": "**bold**",
     }
     assert calls[0]["stream_options"] == {"include_usage": True}
+    assert calls[0]["stream"] is True
+    assert calls[0]["tools"] == non_strict_tools
     assert completion.choices[0].message.content == "**bold**"
     assert completion.choices[0].finish_reason == "stop"
     assert completion.usage is not None
@@ -488,7 +496,7 @@ async def test_streaming_reassembles_fragmented_tool_calls() -> None:
     )
 
     class FakeCompletions:
-        def stream(self, **kwargs: Any) -> FakeChatCompletionStream:
+        async def create(self, **kwargs: Any) -> FakeChatCompletionStream:
             return completion_stream
 
     agent = Agent(telemetry=AgentTelemetry())

@@ -12,6 +12,7 @@ from typing import Any
 import yaml
 from aioconsole import ainput
 from openai import AsyncOpenAI
+from openai.lib.streaming.chat import ChatCompletionStreamState
 from openai.types import CompletionUsage
 from openai.types.chat import ChatCompletion
 
@@ -458,20 +459,23 @@ class Agent:
             return await self.client.chat.completions.create(**request)
 
         started_output = False
-
-        async with self.client.chat.completions.stream(
+        completion_stream = await self.client.chat.completions.create(
             **request,
+            stream=True,
             stream_options={"include_usage": True},
-        ) as completion_stream:
-            async for event in completion_stream:
-                if event.type != "content.delta":
-                    continue
-                if not started_output:
-                    print(f"\n{CYAN}⏺{RESET} ", end="", flush=True)
-                    started_output = True
-                print(event.delta, end="", flush=True)
+        )
+        stream_state = ChatCompletionStreamState()
+        async with completion_stream:
+            async for chunk in completion_stream:
+                for event in stream_state.handle_chunk(chunk):
+                    if event.type != "content.delta":
+                        continue
+                    if not started_output:
+                        print(f"\n{CYAN}⏺{RESET} ", end="", flush=True)
+                        started_output = True
+                    print(event.delta, end="", flush=True)
 
-            completion = await completion_stream.get_final_completion()
+        completion = stream_state.get_final_completion()
 
         if started_output:
             print()
