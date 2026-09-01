@@ -9,7 +9,6 @@ from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any
 
-import yaml
 from aioconsole import ainput
 from openai import AsyncOpenAI
 from openai.lib.streaming.chat import ChatCompletionStreamState
@@ -23,6 +22,7 @@ from code_agent.mcp_tool import MCPTool
 from code_agent.memory import Memory
 from code_agent.session import Session
 from code_agent.settings import settings
+from code_agent.skill_registry import SkillRegistry, parse_frontmatter
 from code_agent.telemetry import AgentTelemetry
 from code_agent.tool import (
     BashTool,
@@ -89,18 +89,7 @@ def rsp2msg(resp):
         ),
     }
 
-def _parse_frontmatter(text: str) -> tuple[dict, str]:
-    """Parse YAML frontmatter from SKILL.md. Returns (meta, body)."""
-    if not text.startswith("---"):
-        return {}, text
-    parts = text.split("---", 2)
-    if len(parts) < 3:
-        return {}, text
-    try:
-        meta = yaml.safe_load(parts[1]) or {}
-    except yaml.YAMLError:
-        meta = {}
-    return meta, parts[2].strip()
+_parse_frontmatter = parse_frontmatter  # Backward-compatible private import.
 
 
 class Agent:
@@ -113,7 +102,6 @@ class Agent:
     hooks: dict[str, list[callable]]
     context_manager : ContextManager
     session: Session
-    skill_registry : dict[str,dict]
     bgManager: BackgroundManager
     memory : Memory
 
@@ -128,6 +116,7 @@ class Agent:
             "Stop": [], # a turn stop. Before next turn begin.
         }
         self.bgManager = BackgroundManager()
+        self._skill_registry = SkillRegistry()
         self.system_prompt = system_prompt
         self.session = Session(
             sys_prompt=system_prompt,
@@ -145,22 +134,10 @@ class Agent:
         self.session.append_message(message, usage=usage)
 
     def _list_skills(self) -> str:
-        return "\n".join(f"- **{s['name']}**: {s['description']}" for s in self.skill_registry.values())
+        return self._skill_registry.format_list()
 
-    def _scan_skills(self,skills_dir : Path| None = None):
-        self.skill_registry = {}
-        if skills_dir == None or not skills_dir.exists():
-            return
-        for d in sorted(skills_dir.iterdir()):
-            if not d.is_dir():
-                continue
-            manifest = d / "SKILL.md"
-            if manifest.exists():
-                raw = manifest.read_text()
-                meta, _body = _parse_frontmatter(raw)
-                name = meta.get("name", d.name)
-                desc = meta.get("description", raw.split("\n")[0].lstrip("#").strip())
-                self.skill_registry[name] = {"name": name, "description": desc, "content": raw}
+    def _scan_skills(self, skills_dir: Path | None = None) -> None:
+        self._skill_registry.scan(skills_dir)
 
     def registHook(self, event: str, func: callable):
         self.hooks[event].append(func)
