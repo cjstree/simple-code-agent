@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 from typing import Any, Self
 
@@ -135,6 +136,32 @@ async def test_agent_trigger_hook_awaits_async_callbacks_in_order() -> None:
     await agent.triggerHook("PreLLMSubmit")
 
     assert calls == ["sync", "async"]
+
+
+@pytest.mark.asyncio
+async def test_agent_trigger_hook_stops_after_first_returned_result() -> None:
+    # A hook result short-circuits later callbacks and is returned to the caller.
+    agent = Agent(telemetry=AgentTelemetry())
+    calls: list[str] = []
+
+    def allow_hook() -> None:
+        calls.append("allow")
+
+    async def deny_hook() -> bool:
+        calls.append("deny")
+        return False
+
+    def skipped_hook() -> None:
+        calls.append("skipped")
+
+    agent.registHook("PreToolUse", allow_hook)
+    agent.registHook("PreToolUse", deny_hook)
+    agent.registHook("PreToolUse", skipped_hook)
+
+    result = await agent.triggerHook("PreToolUse")
+
+    assert result is False
+    assert calls == ["allow", "deny"]
 
 
 @pytest.mark.asyncio
@@ -349,6 +376,56 @@ async def test_agent_keeps_mcp_open_until_close(
 
     assert mcp_client.exited is True
     assert agent.mcp_client is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_type", [RuntimeError, asyncio.CancelledError])
+async def test_agent_releases_mcp_when_startup_does_not_complete(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[BaseException],
+) -> None:
+    # MCP resources are released when discovery fails or startup is cancelled.
+    monkeypatch.setattr(settings, "llm_api_key", "test-key")
+    monkeypatch.setattr(settings, "llm_model_name", "test-model")
+    monkeypatch.setattr(settings, "mcp_url", "https://mcp.example.test")
+    clients: list[Any] = []
+
+    class FakeMCPClient:
+        def __init__(self, *, url: str | None, connect_timeout: float) -> None:
+            self.url = url
+            self.connect_timeout = connect_timeout
+            self.entered = False
+            self.exit_count = 0
+            clients.append(self)
+
+        async def __aenter__(self) -> Self:
+            self.entered = True
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback) -> None:
+            self.exit_count += 1
+
+    async def fail_discovery(client: FakeMCPClient) -> list[Any]:
+        del client
+        raise failure_type("tool discovery did not complete")
+
+    monkeypatch.setattr("code_agent.agent.MCPClient", FakeMCPClient)
+    monkeypatch.setattr(
+        "code_agent.agent.MCPTool",
+        SimpleNamespace(discover=fail_discovery),
+    )
+    agent = Agent(telemetry=AgentTelemetry())
+
+    with pytest.raises(failure_type, match="tool discovery did not complete"):
+        await agent.start()
+
+    assert len(clients) == 1
+    assert clients[0].entered is True
+    assert clients[0].exit_count == 1
+    assert agent.mcp_client is None
+
+    await agent.close()
+    assert clients[0].exit_count == 1
 
 
 @pytest.mark.asyncio
@@ -575,6 +652,354 @@ async def test_agent_completes_one_tool_call_cycle() -> None:
         "content": "result: 2",
     }
     assert messages[-1]["content"] == "finished"
+
+
+@pytest.mark.asyncio
+async def test_agent_records_invalid_tool_arguments_before_continuing() -> None:
+    # Invalid tool JSON becomes an ordered tool result visible to the next request.
+    tool_call = ChatCompletionMessageFunctionToolCall(
+        id="call-invalid-json",
+        type="function",
+        function=Function(name="echo", arguments='{"value":'),
+    )
+    responses = iter(
+        [
+            chat_completion(
+                ChatCompletionMessage(
+                    role="assistant", content=None, tool_calls=[tool_call]
+                ),
+                finish_reason="tool_calls",
+            ),
+            chat_completion(
+                ChatCompletionMessage(role="assistant", content="recovered"),
+                finish_reason="stop",
+            ),
+        ]
+    )
+    request_contexts: list[list[dict[str, Any]]] = []
+    registry = FakeRegistry()
+    agent = Agent(telemetry=AgentTelemetry())
+    agent.tool_registry = registry  # type: ignore[assignment]
+    agent.session = Session(
+        sys_prompt="test system",
+        client=object(),  # type: ignore[arg-type]
+    )
+    agent.session.append_message({"role": "user", "content": "run the tool"})
+    agent.max_tool_round = 2
+
+    async def call_api(messages: list[dict[str, Any]]) -> ChatCompletion:
+        request_contexts.append(messages)
+        return next(responses)
+
+    agent._call_api = call_api  # type: ignore[method-assign]
+
+    completion = await agent._agent_loop()
+
+    assert completion.choices[0].message.content == "recovered"
+    assert registry.calls == []
+    tool_result = request_contexts[1][-1]
+    assert tool_result["role"] == "tool"
+    assert tool_result["tool_call_id"] == "call-invalid-json"
+    assert tool_result["content"].startswith("error: invalid JSON tool arguments:")
+
+
+@pytest.mark.asyncio
+async def test_agent_records_tool_failure_before_continuing() -> None:
+    # A tool exception becomes a matching tool result visible to the next request.
+    tool_call = ChatCompletionMessageFunctionToolCall(
+        id="call-failed",
+        type="function",
+        function=Function(name="echo", arguments='{"value": 2}'),
+    )
+    responses = iter(
+        [
+            chat_completion(
+                ChatCompletionMessage(
+                    role="assistant", content=None, tool_calls=[tool_call]
+                ),
+                finish_reason="tool_calls",
+            ),
+            chat_completion(
+                ChatCompletionMessage(role="assistant", content="recovered"),
+                finish_reason="stop",
+            ),
+        ]
+    )
+    request_contexts: list[list[dict[str, Any]]] = []
+
+    class FailingRegistry(FakeRegistry):
+        async def run_tool(
+            self,
+            tool_name: str,
+            arguments: dict[str, Any],
+            *,
+            approved: bool = False,
+        ) -> str:
+            self.calls.append((tool_name, arguments))
+            self.approvals.append(approved)
+            raise OSError("tool backend unavailable")
+
+    registry = FailingRegistry()
+    agent = Agent(telemetry=AgentTelemetry())
+    agent.tool_registry = registry  # type: ignore[assignment]
+    agent.session = Session(
+        sys_prompt="test system",
+        client=object(),  # type: ignore[arg-type]
+    )
+    agent.session.append_message({"role": "user", "content": "run the tool"})
+    agent.max_tool_round = 2
+
+    async def call_api(messages: list[dict[str, Any]]) -> ChatCompletion:
+        request_contexts.append(messages)
+        return next(responses)
+
+    agent._call_api = call_api  # type: ignore[method-assign]
+
+    completion = await agent._agent_loop()
+
+    assert completion.choices[0].message.content == "recovered"
+    assert registry.calls == [("echo", {"value": 2})]
+    tool_result = request_contexts[1][-1]
+    assert tool_result["role"] == "tool"
+    assert tool_result["tool_call_id"] == "call-failed"
+    assert tool_result["content"].startswith("error: tool run error:")
+    assert "tool backend unavailable" in tool_result["content"]
+
+
+@pytest.mark.asyncio
+async def test_agent_preserves_order_when_one_of_multiple_tools_fails() -> None:
+    # A failed tool does not prevent later calls, and both results retain call order.
+    tool_calls = [
+        ChatCompletionMessageFunctionToolCall(
+            id="call-first",
+            type="function",
+            function=Function(name="first", arguments="{}"),
+        ),
+        ChatCompletionMessageFunctionToolCall(
+            id="call-second",
+            type="function",
+            function=Function(name="second", arguments="{}"),
+        ),
+    ]
+    responses = iter(
+        [
+            chat_completion(
+                ChatCompletionMessage(
+                    role="assistant", content=None, tool_calls=tool_calls
+                ),
+                finish_reason="tool_calls",
+            ),
+            chat_completion(
+                ChatCompletionMessage(role="assistant", content="finished"),
+                finish_reason="stop",
+            ),
+        ]
+    )
+    request_contexts: list[list[dict[str, Any]]] = []
+
+    class MixedRegistry(FakeRegistry):
+        async def run_tool(
+            self,
+            tool_name: str,
+            arguments: dict[str, Any],
+            *,
+            approved: bool = False,
+        ) -> str:
+            self.calls.append((tool_name, arguments))
+            self.approvals.append(approved)
+            if tool_name == "first":
+                raise RuntimeError("first failed")
+            return "second succeeded"
+
+    registry = MixedRegistry()
+    agent = Agent(telemetry=AgentTelemetry())
+    agent.tool_registry = registry  # type: ignore[assignment]
+    agent.session = Session(
+        sys_prompt="test system",
+        client=object(),  # type: ignore[arg-type]
+    )
+    agent.session.append_message({"role": "user", "content": "run both tools"})
+    agent.max_tool_round = 2
+
+    async def call_api(messages: list[dict[str, Any]]) -> ChatCompletion:
+        request_contexts.append(messages)
+        return next(responses)
+
+    agent._call_api = call_api  # type: ignore[method-assign]
+
+    await agent._agent_loop()
+
+    assert registry.calls == [("first", {}), ("second", {})]
+    visible_results = request_contexts[1][-2:]
+    assert [result["tool_call_id"] for result in visible_results] == [
+        "call-first",
+        "call-second",
+    ]
+    assert "first failed" in visible_results[0]["content"]
+    assert visible_results[1]["content"] == "second succeeded"
+
+
+@pytest.mark.asyncio
+async def test_agent_records_denied_sensitive_tool_before_continuing() -> None:
+    # A denied sensitive call remains visible as a tool result before continuing.
+    tool_call = ChatCompletionMessageFunctionToolCall(
+        id="call-denied",
+        type="function",
+        function=Function(name="write", arguments='{"path": "notes.txt"}'),
+    )
+    responses = iter(
+        [
+            chat_completion(
+                ChatCompletionMessage(
+                    role="assistant", content=None, tool_calls=[tool_call]
+                ),
+                finish_reason="tool_calls",
+            ),
+            chat_completion(
+                ChatCompletionMessage(role="assistant", content="not written"),
+                finish_reason="stop",
+            ),
+        ]
+    )
+    request_contexts: list[list[dict[str, Any]]] = []
+    registry = FakeRegistry(sensitive=True)
+    agent = Agent(telemetry=AgentTelemetry())
+    agent.tool_registry = registry  # type: ignore[assignment]
+    agent.session = Session(
+        sys_prompt="test system",
+        client=object(),  # type: ignore[arg-type]
+    )
+    agent.session.append_message({"role": "user", "content": "write a note"})
+    agent.max_tool_round = 2
+
+    async def deny_permission(tool_name: str) -> bool:
+        assert tool_name == "write"
+        return False
+
+    async def call_api(messages: list[dict[str, Any]]) -> ChatCompletion:
+        request_contexts.append(messages)
+        return next(responses)
+
+    agent._ask_permission = deny_permission  # type: ignore[method-assign]
+    agent.registHook("PreToolUse", agent.check_tool_permission)
+    agent._call_api = call_api  # type: ignore[method-assign]
+
+    completion = await agent._agent_loop()
+
+    assert completion.choices[0].message.content == "not written"
+    assert registry.calls == [("write", {"path": "notes.txt"})]
+    assert registry.approvals == [False]
+    tool_result = request_contexts[1][-1]
+    assert tool_result["role"] == "tool"
+    assert tool_result["tool_call_id"] == "call-denied"
+    assert "requires approval" in tool_result["content"]
+
+
+@pytest.mark.asyncio
+async def test_agent_stops_after_maximum_tool_rounds_with_result_recorded(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The round limit stops another model request after recording the last result.
+    tool_call = ChatCompletionMessageFunctionToolCall(
+        id="call-limit",
+        type="function",
+        function=Function(name="echo", arguments='{"value": 2}'),
+    )
+    response = chat_completion(
+        ChatCompletionMessage(role="assistant", content=None, tool_calls=[tool_call]),
+        finish_reason="tool_calls",
+    )
+    request_count = 0
+    stop_contexts: list[list[dict[str, Any]]] = []
+    registry = FakeRegistry()
+    agent = Agent(telemetry=AgentTelemetry())
+    agent.tool_registry = registry  # type: ignore[assignment]
+    agent.session = Session(
+        sys_prompt="test system",
+        client=object(),  # type: ignore[arg-type]
+    )
+    agent.session.append_message({"role": "user", "content": "keep using tools"})
+    agent.max_tool_round = 1
+
+    async def call_api(messages: list[dict[str, Any]]) -> ChatCompletion:
+        nonlocal request_count
+        request_count += 1
+        return response
+
+    def observe_stop() -> None:
+        stop_contexts.append(agent.session.build_context())
+
+    agent._call_api = call_api  # type: ignore[method-assign]
+    agent.registHook("Stop", observe_stop)
+
+    completion = await agent._agent_loop()
+
+    assert completion is response
+    assert request_count == 1
+    assert registry.calls == [("echo", {"value": 2})]
+    assert stop_contexts[0][-1] == {
+        "role": "tool",
+        "tool_call_id": "call-limit",
+        "content": "result: 2",
+    }
+    assert "Maximum tool-call rounds reached." in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_agent_builds_dynamic_system_prompt_from_skills_and_memory() -> None:
+    # Dynamic prompts expose registered skills and selected memory to the model.
+    selected_contexts: list[list[dict[str, Any]]] = []
+    agent = Agent(telemetry=AgentTelemetry())
+    agent.skill_registry = {
+        "reviewing": {
+            "name": "reviewing",
+            "description": "Review Python code",
+            "content": "full instructions",
+        }
+    }
+    agent.session = Session(
+        sys_prompt="",
+        client=object(),  # type: ignore[arg-type]
+    )
+    agent.session.append_message({"role": "user", "content": "review this"})
+
+    async def select_relevant_memories(
+        messages: list[dict[str, Any]],
+    ) -> list[str]:
+        selected_contexts.append(messages)
+        return ["Prefer focused tests."]
+
+    agent.memory = SimpleNamespace(select_relevant_memories=select_relevant_memories)
+
+    await agent.build_system()
+
+    prompt = agent.session.system_prompt
+    assert selected_contexts[0][-1] == {"role": "user", "content": "review this"}
+    assert "- **reviewing**: Review Python code" in prompt
+    assert "<memory>\nPrefer focused tests.\n</memory>" in prompt
+
+
+@pytest.mark.asyncio
+async def test_agent_preserves_explicit_system_prompt_without_memory_lookup() -> None:
+    # An explicit system prompt bypasses dynamic skill and memory augmentation.
+    agent = Agent(
+        telemetry=AgentTelemetry(),
+        system_prompt="Use the fixed system contract.",
+    )
+    agent.skill_registry = {}
+    agent.session = Session(
+        sys_prompt="stale prompt",
+        client=object(),  # type: ignore[arg-type]
+    )
+
+    async def unexpected_memory_lookup(messages: list[dict[str, Any]]) -> list[str]:
+        pytest.fail(f"memory lookup was not expected: {messages}")
+
+    agent.memory = SimpleNamespace(select_relevant_memories=unexpected_memory_lookup)
+
+    await agent.build_system()
+
+    assert agent.session.system_prompt == "Use the fixed system contract."
 
 
 @pytest.mark.parametrize("finish_reason", ["stop", "length", "content_filter"])
