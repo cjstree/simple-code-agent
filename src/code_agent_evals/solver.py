@@ -11,8 +11,13 @@ def _runner_payload(state: TaskState) -> str:
     metadata = state.metadata or {}
     turns = metadata.get("turns", [state.input_text])
     agent_config = metadata.get("agent_config", {})
+    restart_agent_after_turns = metadata.get("restart_agent_after_turns", [])
     return json.dumps(
-        {"turns": turns, "agent_config": agent_config},
+        {
+            "turns": turns,
+            "agent_config": agent_config,
+            "restart_agent_after_turns": restart_agent_after_turns,
+        },
         ensure_ascii=False,
     )
 

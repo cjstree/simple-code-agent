@@ -1,0 +1,25 @@
+diff --git a/release_builder.py b/release_builder.py
+index 3844088..0ab6672 100644
+--- a/release_builder.py
++++ b/release_builder.py
+@@ -1,7 +1,8 @@
+ from release_models import ReleaseManifest
+ 
+-DEFAULT_CHANNEL = "legacy"
+-TRACKING_MARKER = ""
++DEFAULT_CHANNEL = "canary-v2"
++HOTFIX_CHANNEL = "stable"
++TRACKING_MARKER = "ORCHID-731"
+ 
+ 
+ def build_manifest(version: str) -> ReleaseManifest:
+@@ -14,4 +15,8 @@ def build_manifest(version: str) -> ReleaseManifest:
+ 
+ 
+ def build_hotfix_manifest(version: str) -> ReleaseManifest:
+-    return build_manifest(version)
++    return ReleaseManifest(
++        version=version,
++        channel=HOTFIX_CHANNEL,
++        tracking_marker=TRACKING_MARKER,
++    )

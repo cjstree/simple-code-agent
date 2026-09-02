@@ -30,10 +30,6 @@ class SkillRegistry:
     def entries(self) -> dict[str, dict[str, str]]:
         return self._entries
 
-    def replace(self, entries: dict[str, dict[str, str]]) -> None:
-        """Replace all entries while preserving Agent's compatibility API."""
-        self._entries = entries
-
     def scan(self, skills_dir: Path | None = None) -> None:
         """Replace entries with manifests found under immediate child folders."""
         self._entries = {}
@@ -59,6 +55,11 @@ class SkillRegistry:
                 "description": description,
                 "content": raw,
             }
+
+    def get_content(self, name: str) -> str | None:
+        """Return a registered skill manifest, or None when it is unknown."""
+        skill = self._entries.get(name)
+        return skill["content"] if skill is not None else None
 
     def format_list(self) -> str:
         """Render the compact skill list embedded in the system prompt."""

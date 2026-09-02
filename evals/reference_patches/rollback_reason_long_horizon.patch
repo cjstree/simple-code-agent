@@ -1,0 +1,44 @@
+diff --git a/deployment_api.py b/deployment_api.py
+index 3193529..467ae1f 100644
+--- a/deployment_api.py
++++ b/deployment_api.py
+@@ -13,4 +13,5 @@ def rollback_deployment(
+     return {
+         "deployment_id": deployment.deployment_id,
+         "status": deployment.status,
++        "rollback_reason": deployment.rollback_reason,
+     }
+diff --git a/deployment_repository.py b/deployment_repository.py
+index 8410357..eb07db7 100644
+--- a/deployment_repository.py
++++ b/deployment_repository.py
+@@ -10,6 +10,7 @@ class DeploymentRepository:
+         self._rows[deployment.deployment_id] = {
+             "deployment_id": deployment.deployment_id,
+             "status": deployment.status,
++            "rollback_reason": deployment.rollback_reason,
+         }
+ 
+     def get(self, deployment_id: str) -> Deployment:
+@@ -17,4 +18,5 @@ class DeploymentRepository:
+         return Deployment(
+             deployment_id=row["deployment_id"],
+             status=row["status"],
++            rollback_reason=row.get("rollback_reason"),
+         )
+diff --git a/deployment_service.py b/deployment_service.py
+index 9433629..ffbc2f5 100644
+--- a/deployment_service.py
++++ b/deployment_service.py
+@@ -15,7 +15,11 @@ class DeploymentService:
+ 
+     def rollback(self, deployment_id: str, reason: str) -> Deployment:
+         deployment = self.repository.get(deployment_id)
++        if deployment.status == "rolled_back":
++            return deployment
++
+         deployment.status = "rolled_back"
++        deployment.rollback_reason = reason
+         self.repository.save(deployment)
+         self.audit_log.record("deployment_rolled_back", deployment_id)
+         return deployment

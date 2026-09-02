@@ -22,7 +22,7 @@ from code_agent.mcp_tool import MCPTool
 from code_agent.memory import Memory
 from code_agent.session import Session
 from code_agent.settings import settings
-from code_agent.skill_registry import SkillRegistry, parse_frontmatter
+from code_agent.skill_registry import SkillRegistry
 from code_agent.telemetry import AgentTelemetry
 from code_agent.tool import (
     BashTool,
@@ -89,9 +89,6 @@ def rsp2msg(resp):
         ),
     }
 
-_parse_frontmatter = parse_frontmatter  # Backward-compatible private import.
-
-
 class Agent:
     "an agent implemention. using cli command to intereact. can use tools."
 
@@ -102,6 +99,7 @@ class Agent:
     hooks: dict[str, list[callable]]
     context_manager : ContextManager
     session: Session
+    skill_registry: SkillRegistry
     bgManager: BackgroundManager
     memory : Memory
 
@@ -116,7 +114,7 @@ class Agent:
             "Stop": [], # a turn stop. Before next turn begin.
         }
         self.bgManager = BackgroundManager()
-        self._skill_registry = SkillRegistry()
+        self.skill_registry = SkillRegistry()
         self.system_prompt = system_prompt
         self.session = Session(
             sys_prompt=system_prompt,
@@ -132,12 +130,6 @@ class Agent:
         usage: CompletionUsage | None = None,
     ) -> None:
         self.session.append_message(message, usage=usage)
-
-    def _list_skills(self) -> str:
-        return self._skill_registry.format_list()
-
-    def _scan_skills(self, skills_dir: Path | None = None) -> None:
-        self._skill_registry.scan(skills_dir)
 
     def registHook(self, event: str, func: callable):
         self.hooks[event].append(func)
@@ -204,7 +196,7 @@ class Agent:
             api_key=settings.llm_api_key,
             base_url=settings.llm_base_url,
         )
-        self._scan_skills(skills_dir = Path("./skills"))
+        self.skill_registry.scan(Path("./skills"))
         self.context_manager = ContextManager(self.client, telemetry=self.telemetry)
         self.session = Session(sys_prompt=self.system_prompt,client=self.client,telemetry=self.telemetry)
         self.memory = Memory(
@@ -472,7 +464,7 @@ class Agent:
                 (
                     f"You are a coding agent at {os.getcwd()}. "
                     "Use tools to solve tasks.\n"
-                    f"Skills available:\n{self._list_skills()}\n"
+                    f"Skills available:\n{self.skill_registry.format_list()}\n"
                     "Use load_skill to get full details when needed."
                 ),
             ]

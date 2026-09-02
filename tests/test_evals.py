@@ -22,7 +22,7 @@ def test_basic_agent_eval_uses_isolated_file_fixture() -> None:
 
     assert task.sandbox is not None
     assert task.sandbox.type == "local"
-    assert len(task.dataset) == 7
+    assert len(task.dataset) == 9
 
     samples = {sample.id: sample for sample in task.dataset}
     sample = samples["fix_add"]
@@ -56,7 +56,7 @@ def test_multiturn_eval_payload_is_available_to_runner() -> None:
     samples = {sample.id: sample for sample in task.dataset}
     sample = samples["fix_add_multiturn_compact"]
 
-    turns, config = parse_payload(
+    turns, config, restart_after_turns = parse_payload(
         json.dumps(
             {
                 "turns": sample.metadata["turns"],
@@ -68,14 +68,19 @@ def test_multiturn_eval_payload_is_available_to_runner() -> None:
     assert len(turns) == 3
     assert turns[-1] == "Now fix the implementation and run the tests."
     assert config == {"compact_thresh_hold": 500}
+    assert restart_after_turns == ()
 
 
 # Existing single-prompt callers remain valid while context settings are
 # restricted to the allowlisted evaluation thresholds.
 def test_runner_accepts_legacy_prompt_and_applies_session_config() -> None:
     # Legacy prompts still work and eval thresholds configure the Session.
-    assert parse_payload("plain prompt") == (["plain prompt"], {})
-    assert parse_payload('"JSON-shaped prompt"') == (['"JSON-shaped prompt"'], {})
+    assert parse_payload("plain prompt") == (["plain prompt"], {}, ())
+    assert parse_payload('"JSON-shaped prompt"') == (
+        ['"JSON-shaped prompt"'],
+        {},
+        (),
+    )
     session = SimpleNamespace(compact_thresh_hold=128_000)
     agent = SimpleNamespace(session=session)
 
@@ -109,6 +114,7 @@ def test_solver_serializes_multiturn_runner_payload() -> None:
     assert json.loads(_runner_payload(state)) == {
         "turns": ["first", "second"],
         "agent_config": {"compact_thresh_hold": 600},
+        "restart_agent_after_turns": [],
     }
 
 
@@ -134,7 +140,11 @@ async def test_solver_runs_agent_without_bridge_or_llm_overrides(monkeypatch) ->
             [sys.executable, "-m", "code_agent_evals.runner"],
             {
                 "input": json.dumps(
-                    {"turns": ["fix it"], "agent_config": {}},
+                    {
+                        "turns": ["fix it"],
+                        "agent_config": {},
+                        "restart_agent_after_turns": [],
+                    },
                     ensure_ascii=False,
                 ),
                 "timeout": 300,
@@ -189,6 +199,134 @@ async def test_runner_executes_turns_in_one_agent_session(monkeypatch) -> None:
     ]
     assert agents[0].session.compact_thresh_hold == 500
     assert agents[0].closed is True
+
+
+@pytest.mark.asyncio
+async def test_runner_restarts_agent_between_memory_handoff_episodes(
+    monkeypatch,
+) -> None:
+    # A requested restart closes the old Agent and starts a fresh configured session.
+    agents = []
+
+    class FakeAgent:
+        def __init__(self, telemetry) -> None:
+            self.telemetry = telemetry
+            self.session = SimpleNamespace(compact_thresh_hold=128_000)
+            self.calls: list[tuple[str, bool]] = []
+            self.closed = False
+            agents.append(self)
+
+        async def start(self) -> None:
+            return None
+
+        async def run(self, turn: str, *, new_session: bool = True) -> str:
+            self.calls.append((turn, new_session))
+            return f"answer: {turn}"
+
+        async def close(self) -> None:
+            self.closed = True
+
+    telemetry = SimpleNamespace(shutdown=lambda: None)
+    monkeypatch.setattr(runner, "Agent", FakeAgent)
+    monkeypatch.setattr(
+        runner,
+        "AgentTelemetry",
+        SimpleNamespace(initialize=lambda **kwargs: telemetry),
+    )
+
+    result = await runner.run(
+        ["learn convention", "recall convention", "implement"],
+        {"compact_thresh_hold": 1_200},
+        (1,),
+    )
+
+    assert result == "answer: implement"
+    assert [agent.calls for agent in agents] == [
+        [("learn convention", True)],
+        [("recall convention", True), ("implement", False)],
+    ]
+    assert [agent.session.compact_thresh_hold for agent in agents] == [1_200, 1_200]
+    assert all(agent.closed for agent in agents)
+
+
+def test_runner_validates_agent_restart_boundaries() -> None:
+    # Restarts may occur once after any turn except the final turn.
+    turns, _, restart_after_turns = parse_payload(
+        json.dumps(
+            {
+                "turns": ["first", "second", "third"],
+                "restart_agent_after_turns": [2, 1],
+            }
+        )
+    )
+
+    assert turns == ["first", "second", "third"]
+    assert restart_after_turns == (1, 2)
+
+    with pytest.raises(ValueError, match="non-final turn"):
+        parse_payload(
+            json.dumps(
+                {
+                    "turns": ["first", "second"],
+                    "restart_agent_after_turns": [2],
+                }
+            )
+        )
+
+    with pytest.raises(ValueError, match="duplicates"):
+        parse_payload(
+            json.dumps(
+                {
+                    "turns": ["first", "second"],
+                    "restart_agent_after_turns": [1, 1],
+                }
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_runner_cleans_up_when_replacement_agent_cannot_start(
+    monkeypatch,
+) -> None:
+    # A failed episode restart closes both Agent instances and shuts down telemetry.
+    agents = []
+
+    class FakeAgent:
+        def __init__(self, telemetry) -> None:
+            self.telemetry = telemetry
+            self.session = SimpleNamespace(compact_thresh_hold=128_000)
+            self.closed = False
+            agents.append(self)
+
+        async def start(self) -> None:
+            if len(agents) == 2:
+                raise RuntimeError("replacement startup failed")
+
+        async def run(self, turn: str, *, new_session: bool = True) -> str:
+            return turn
+
+        async def close(self) -> None:
+            self.closed = True
+
+    telemetry = SimpleNamespace(shutdown_called=False)
+
+    def shutdown() -> None:
+        telemetry.shutdown_called = True
+
+    telemetry.shutdown = shutdown
+    monkeypatch.setattr(runner, "Agent", FakeAgent)
+    monkeypatch.setattr(
+        runner,
+        "AgentTelemetry",
+        SimpleNamespace(initialize=lambda **kwargs: telemetry),
+    )
+
+    with pytest.raises(RuntimeError, match="replacement startup failed"):
+        await runner.run(["learn", "recall"], {}, (1,))
+
+    assert len(agents) == 2
+    assert all(agent.closed for agent in agents)
+    assert telemetry.shutdown_called is True
 
 
 def test_evaluation_contract_requires_safe_disjoint_test_groups() -> None:
@@ -367,6 +505,44 @@ def test_mini_swe_samples_define_levels_and_external_hidden_tests() -> None:
         assert (project_root / "evals" / "hidden_tests" / sample_id).is_dir()
 
 
+def test_mixed_capability_samples_document_scenarios_and_runner_behavior() -> None:
+    # The two mixed cases state their focus, overlap, trace signals, and turn topology.
+    task = basic_agent_eval()
+    samples = {str(sample.id): sample for sample in task.dataset}
+
+    rollback = samples["rollback_reason_long_horizon"]
+    assert rollback.metadata["focus"] == "multi_turn_compaction_following"
+    assert len(rollback.metadata["turns"]) == 5
+    assert rollback.metadata["agent_config"]["compact_thresh_hold"] == 1_400
+    assert "history_compaction" in rollback.metadata["covers"]
+    assert len(rollback.metadata["trace_expectations"]) == 2
+
+    memory = samples["release_policy_memory_handoff"]
+    assert memory.metadata["focus"] == "cross_turn_memory"
+    assert memory.metadata["restart_agent_after_turns"] == [1]
+    assert len(memory.metadata["turns"]) == 4
+    assert "memory_extraction" in memory.metadata["covers"]
+    assert "agent_restart" in memory.metadata["covers"]
+    assert len(memory.metadata["trace_expectations"]) == 2
+
+    payload = json.loads(
+        _runner_payload(
+            SimpleNamespace(input_text=memory.input, metadata=memory.metadata)
+        )
+    )
+    assert payload["restart_agent_after_turns"] == [1]
+
+    project_root = Path(__file__).resolve().parents[1]
+    for sample in (rollback, memory):
+        assert sample.metadata["scenario_description"]
+        assert sample.metadata["regression_purpose"]
+        assert evaluation_contract(sample.metadata) is not None
+        assert (project_root / "evals" / sample.metadata["reference_patch"]).is_file()
+        assert sample.files is not None
+        assert Path(sample.files["."]).is_dir()
+        assert (project_root / "evals" / "hidden_tests" / str(sample.id)).is_dir()
+
+
 def test_pristine_mini_swe_fixtures_fail_only_regressions() -> None:
     # Buggy fixtures fail every FAIL_TO_PASS group while preserving PASS_TO_PASS.
     project_root = Path(__file__).resolve().parents[1]
@@ -374,7 +550,7 @@ def test_pristine_mini_swe_fixtures_fail_only_regressions() -> None:
     samples = [
         sample
         for sample in task.dataset
-        if (sample.metadata or {}).get("level") in {"L2", "L3"}
+        if evaluation_contract(sample.metadata) is not None
     ]
 
     def source_selector(sample_id: str, fixture: Path, selector: str) -> str:
@@ -443,7 +619,7 @@ def test_reference_patches_satisfy_visible_and_hidden_contracts(tmp_path) -> Non
     samples = [
         sample
         for sample in task.dataset
-        if (sample.metadata or {}).get("level") in {"L2", "L3"}
+        if evaluation_contract(sample.metadata) is not None
     ]
 
     for sample in samples:

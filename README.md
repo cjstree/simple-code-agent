@@ -157,6 +157,36 @@ Agent 和消息历史；`agent_config` 可以降低 eval 中的 compact 阈值�
 `max_tool_round_res`、`persist_threshold` 和 `reserved_token`，值必须为正整数。
 省略 `metadata.turns` 时，runner 仍将 `input` 作为单轮任务执行。
 
+需要验证持久化 memory 跨 Agent 接力时，可以使用
+`metadata.restart_agent_after_turns`。其中的数字是从 1 开始的轮次编号；runner
+会在对应轮次完成（包括 Stop hook）后关闭当前 Agent，再在同一 sandbox 和工作目录
+启动新 Agent。最后一轮不能配置重启。例如下面会让第二轮由新 Agent 执行，而第一轮
+写入的 `./memory` 仍然保留：
+
+```json
+{"metadata":{"turns":["Learn the project convention.","Apply the saved convention."],"restart_agent_after_turns":[1]}}
+```
+
+`restart_agent_after_turns` 只改变 eval runner 的实例生命周期，不修改 Agent 的生产
+行为。新 Agent 不继承旧 Session 消息，但会重新扫描同一工作目录中的 skills 和
+memory，并重新应用该样例的 `agent_config`。
+
+### 复合能力样例
+
+`rollback_reason_long_horizon` 是五轮真实模型场景。缺陷调查、旧数据兼容、实施方案和
+幂等审计约束被分散到不同轮次，较低的 Session 阈值用于触发重复 history compaction；
+最终 visible/hidden tests 同时检查 API、service、repository 和 audit 的协调结果。
+运行时可通过 trace 中重复出现的 `session.compact_history` 人工确认压缩链路。
+
+`release_policy_memory_handoff` 是两个 Agent episode 组成的真实模型场景。第一个 Agent
+只接收源码中不存在的 release 约定并在 Stop hook 中抽取 memory；runner 随后重启
+Agent。第二个 Agent 必须从磁盘 memory 召回约定、接受当前 hotfix 对其中一个字段的
+覆盖，并在 history compaction 后完成实现。可通过 `memory.extract`、
+`memory.select_relevant` 和 `session.compact_history` trace 人工检查完整链路。
+
+这两个样例都使用普通的小型 Python fixture，不依靠大文件填充上下文。评分仍以
+Agent 完成后的 visible/hidden pytest 行为为准；trace 目前用于人工确认预期能力路径。
+
 mini-SWE 样例还要定义行为级测试契约：
 
 ```json
@@ -185,7 +215,9 @@ mini-SWE 样例还要定义行为级测试契约：
 - `id`：样例唯一标识，用于 `--sample-id` 选择样例。
 - `input`：提交给 Agent 的任务描述。
 - `metadata.turns`：可选的连续用户回合；同一样例内共享 Agent 状态。
-- `metadata.agent_config`：可选的 eval 专用 ContextManager 阈值。
+- `metadata.restart_agent_after_turns`：可选的 1-based 轮次列表；在指定轮次后
+  关闭并重建 Agent，但保留 sandbox 工作目录。
+- `metadata.agent_config`：可选的 eval 专用 Session 阈值。
 - `metadata.level`：case 难度，例如 `L2` 或 `L3`。
 - `metadata.reference_patch`：用于验证 case 可解性和变更层级的参考补丁；不参与评分。
 - `metadata.regression_purpose`：case 覆盖的行为和回归目的。

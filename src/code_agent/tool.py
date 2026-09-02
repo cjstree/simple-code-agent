@@ -11,6 +11,7 @@ from typing import Any, ClassVar, Literal, Protocol
 from pydantic import BaseModel
 
 from code_agent.background_manager import BackgroundManager
+from code_agent.skill_registry import SkillRegistry
 
 _RESET = "\033[0m"
 _DIM = "\033[2m"
@@ -239,8 +240,10 @@ class BashTool:
             output_lines.append("\n(timed out after 30s)")
         return "".join(output_lines).strip() or "(empty)"
 
+
 class LoadSkillsArguments(BaseModel):
     skill_name: str
+
 
 class LoadSkillsTool:
     type = "function"
@@ -248,13 +251,13 @@ class LoadSkillsTool:
     description = "load an exist skill."
     parameters: ClassVar[dict[str, Any]] = LoadSkillsArguments.model_json_schema()
     arguments_model = LoadSkillsArguments
-    skill_registry = {} 
-    def __init__(self,skill_registry : dict[str,dict] | None = {}):
+
+    def __init__(self, skill_registry: SkillRegistry):
         self.skill_registry = skill_registry
+
     async def run(self, arguments: dict[str, Any]) -> str:
         args = self.arguments_model.model_validate(arguments)
-        name = args.skill_name
-        if not name in self.skill_registry:
-            return f"error: skill name: {name} not found!"
-        else :
-            return self.skill_registry[name]['content']
+        content = self.skill_registry.get_content(args.skill_name)
+        if content is None:
+            return f"error: skill name: {args.skill_name} not found!"
+        return content

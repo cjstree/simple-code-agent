@@ -18,15 +18,15 @@ _SESSION_CONFIG_FIELDS = {
 }
 
 
-def parse_payload(raw: str) -> tuple[list[str], dict[str, int]]:
+def parse_payload(raw: str) -> tuple[list[str], dict[str, int], tuple[int, ...]]:
     """Parse the solver payload while accepting legacy single-prompt input."""
     try:
         payload = json.loads(raw)
     except json.JSONDecodeError:
-        return [raw], {}
+        return [raw], {}, ()
 
     if not isinstance(payload, dict):
-        return [raw], {}
+        return [raw], {}, ()
 
     turns = payload.get("turns")
     if (
@@ -51,7 +51,22 @@ def parse_payload(raw: str) -> tuple[list[str], dict[str, int]]:
             raise ValueError(f"agent_config {name} must be a positive integer")
         agent_config[name] = value
 
-    return turns, agent_config
+    raw_restarts = payload.get("restart_agent_after_turns", [])
+    if not isinstance(raw_restarts, list) or any(
+        not isinstance(turn_number, int) or isinstance(turn_number, bool)
+        for turn_number in raw_restarts
+    ):
+        raise TypeError("restart_agent_after_turns must be a list of integers")
+    if any(
+        turn_number < 1 or turn_number >= len(turns) for turn_number in raw_restarts
+    ):
+        raise ValueError(
+            "restart_agent_after_turns entries must identify a non-final turn"
+        )
+    if len(raw_restarts) != len(set(raw_restarts)):
+        raise ValueError("restart_agent_after_turns cannot contain duplicates")
+
+    return turns, agent_config, tuple(sorted(raw_restarts))
 
 
 def apply_agent_config(agent: Agent, config: dict[str, int]) -> None:
@@ -60,42 +75,63 @@ def apply_agent_config(agent: Agent, config: dict[str, int]) -> None:
         setattr(agent.session, name, value)
 
 
-async def run(turns: list[str], agent_config: dict[str, int]) -> str:
-    """Run all evaluation turns in one agent session."""
+async def run(
+    turns: list[str],
+    agent_config: dict[str, int],
+    restart_agent_after_turns: tuple[int, ...] = (),
+) -> str:
+    """Run evaluation turns, optionally restarting Agent between episodes."""
     telemetry = AgentTelemetry.initialize(
         enabled=settings.phoenix_enabled,
         endpoint=settings.phoenix_collector_endpoint,
         project_name=settings.phoenix_project_name,
     )
-    agent = Agent(telemetry=telemetry)
+    agent: Agent | None = None
 
     async def approve_for_eval(tool_name: str) -> bool:
         del tool_name
         return True
 
-    # Evaluations have no interactive terminal. This override is intentionally
-    # confined to the eval-only subprocess and does not change Agent behavior.
-    agent._ask_permission = approve_for_eval  # type: ignore[method-assign]
+    async def start_agent() -> Agent:
+        candidate = Agent(telemetry=telemetry)
+        # Evaluations have no interactive terminal. This override is intentionally
+        # confined to the eval-only subprocess and does not change Agent behavior.
+        candidate._ask_permission = approve_for_eval  # type: ignore[method-assign]
+        try:
+            await candidate.start()
+        except BaseException:
+            await candidate.close()
+            raise
+        apply_agent_config(candidate, agent_config)
+        return candidate
 
     try:
         with redirect_stdout(sys.stderr):
-            await agent.start()
-            apply_agent_config(agent, agent_config)
+            agent = await start_agent()
             result = ""
+            first_turn_for_agent = True
             for index, turn in enumerate(turns):
-                result = await agent.run(turn, new_session=index == 0)
+                result = await agent.run(turn, new_session=first_turn_for_agent)
+                first_turn_for_agent = False
+                turn_number = index + 1
+                if turn_number in restart_agent_after_turns:
+                    await agent.close()
+                    agent = None
+                    agent = await start_agent()
+                    first_turn_for_agent = True
             return result
     finally:
         try:
-            await agent.close()
+            if agent is not None:
+                await agent.close()
         finally:
             telemetry.shutdown()
 
 
 def main() -> None:
     """Read an evaluation payload and write only the final answer to stdout."""
-    turns, agent_config = parse_payload(sys.stdin.read())
-    result = asyncio.run(run(turns, agent_config))
+    turns, agent_config, restart_agent_after_turns = parse_payload(sys.stdin.read())
+    result = asyncio.run(run(turns, agent_config, restart_agent_after_turns))
     print(result)
 
 

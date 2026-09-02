@@ -1,4 +1,5 @@
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Self
 
@@ -946,17 +947,19 @@ async def test_agent_stops_after_maximum_tool_rounds_with_result_recorded(
 
 
 @pytest.mark.asyncio
-async def test_agent_builds_dynamic_system_prompt_from_skills_and_memory() -> None:
+async def test_agent_builds_dynamic_system_prompt_from_skills_and_memory(
+    tmp_path: Path,
+) -> None:
     # Dynamic prompts expose registered skills and selected memory to the model.
     selected_contexts: list[list[dict[str, Any]]] = []
     agent = Agent(telemetry=AgentTelemetry())
-    agent.skill_registry = {
-        "reviewing": {
-            "name": "reviewing",
-            "description": "Review Python code",
-            "content": "full instructions",
-        }
-    }
+    skill_dir = tmp_path / "reviewing"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: reviewing\ndescription: Review Python code\n---\nInstructions",
+        encoding="utf-8",
+    )
+    agent.skill_registry.scan(tmp_path)
     agent.session = Session(
         sys_prompt="",
         client=object(),  # type: ignore[arg-type]
@@ -986,7 +989,6 @@ async def test_agent_preserves_explicit_system_prompt_without_memory_lookup() ->
         telemetry=AgentTelemetry(),
         system_prompt="Use the fixed system contract.",
     )
-    agent.skill_registry = {}
     agent.session = Session(
         sys_prompt="stale prompt",
         client=object(),  # type: ignore[arg-type]

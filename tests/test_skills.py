@@ -73,46 +73,36 @@ def test_skill_registry_scans_manifests_from_explicit_directory(tmp_path) -> Non
 def test_skill_registry_accepts_no_configured_directory() -> None:
     # Scenario: scanning without a configured directory clears the registry.
     registry = SkillRegistry()
-    registry.replace(
-        {
-            "existing": {
-                "name": "existing",
-                "description": "Existing skill",
-                "content": "existing content",
-            }
-        }
-    )
 
     registry.scan(None)
 
     assert registry.entries == {}
 
 
-def test_skill_registry_formats_entries_for_the_system_prompt() -> None:
+def test_skill_registry_formats_entries_for_the_system_prompt(tmp_path) -> None:
     # Scenario: the prompt list preserves registry order and compact formatting.
-    registry = SkillRegistry()
-    registry.replace(
-        {
-            "reviewing": {
-                "name": "reviewing",
-                "description": "Review Python code",
-                "content": "review instructions",
-            },
-            "testing": {
-                "name": "testing",
-                "description": "Test Python code",
-                "content": "test instructions",
-            },
-        }
+    reviewing = tmp_path / "reviewing"
+    reviewing.mkdir()
+    (reviewing / "SKILL.md").write_text(
+        "---\nname: reviewing\ndescription: Review Python code\n---\nReview",
+        encoding="utf-8",
     )
+    testing = tmp_path / "testing"
+    testing.mkdir()
+    (testing / "SKILL.md").write_text(
+        "---\nname: testing\ndescription: Test Python code\n---\nTest",
+        encoding="utf-8",
+    )
+    registry = SkillRegistry()
+    registry.scan(tmp_path)
 
     assert registry.format_list() == (
         "- **reviewing**: Review Python code\n- **testing**: Test Python code"
     )
 
 
-def test_agent_keeps_skill_registry_compatibility_accessors(tmp_path) -> None:
-    # Scenario: Agent delegates scanning and listing while exposing the old mapping.
+def test_agent_owns_skill_registry(tmp_path) -> None:
+    # Scenario: Agent exposes its SkillRegistry as the single skill source of truth.
     skill_dir = tmp_path / "reviewing"
     skill_dir.mkdir()
     manifest = (
@@ -121,26 +111,32 @@ def test_agent_keeps_skill_registry_compatibility_accessors(tmp_path) -> None:
     (skill_dir / "SKILL.md").write_text(manifest, encoding="utf-8")
     agent = Agent(telemetry=AgentTelemetry())
 
-    agent._scan_skills(tmp_path)
+    agent.skill_registry.scan(tmp_path)
 
-    assert agent.skill_registry["reviewing"]["content"] == manifest
-    assert agent._list_skills() == "- **reviewing**: Review Python code"
+    assert agent.skill_registry.get_content("reviewing") == manifest
+    assert agent.skill_registry.format_list() == "- **reviewing**: Review Python code"
 
 
 @pytest.mark.asyncio
-async def test_load_skills_returns_registered_manifest() -> None:
+async def test_load_skills_returns_registered_manifest(tmp_path) -> None:
     # Scenario: loading a registered skill returns its complete manifest.
-    tool = LoadSkillsTool({"reviewing": {"content": "full skill instructions"}})
+    skill_dir = tmp_path / "reviewing"
+    skill_dir.mkdir()
+    manifest = "full skill instructions"
+    (skill_dir / "SKILL.md").write_text(manifest, encoding="utf-8")
+    registry = SkillRegistry()
+    registry.scan(tmp_path)
+    tool = LoadSkillsTool(registry)
 
     result = await tool.run({"skill_name": "reviewing"})
 
-    assert result == "full skill instructions"
+    assert result == manifest
 
 
 @pytest.mark.asyncio
 async def test_load_skills_reports_unknown_skill() -> None:
     # Scenario: requesting an unknown skill returns a readable tool error.
-    tool = LoadSkillsTool({})
+    tool = LoadSkillsTool(SkillRegistry())
 
     result = await tool.run({"skill_name": "missing"})
 
