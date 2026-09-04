@@ -17,6 +17,11 @@ Set `LLM_API_KEY`, `LLM_BASE_URL`, and `LLM_MODEL_NAME` in `.env`. The agent sta
 with local read, search, edit, write, and shell tools. Each mutating or shell tool
 call asks for approval.
 
+The local read tool numbers lines and uses a 1-indexed `offset` with an optional
+line `limit`. To keep large files out of the model context, each result is capped
+at 2,000 lines or 50 KiB and includes the next `offset` when more text is
+available.
+
 MCP integration is optional. Set `MCP_URL` to any Streamable HTTP MCP endpoint,
 for example `http://127.0.0.1:8000/mcp`, to discover and add its remote tools. With
 `MCP_URL` unset, the agent has no runtime dependency on the RAG backend.

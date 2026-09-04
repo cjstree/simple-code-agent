@@ -5,16 +5,53 @@ import glob as globlib
 import json
 import os
 import re
+import shlex
 from pathlib import Path
 from typing import Any, ClassVar, Literal, Protocol
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from code_agent.background_manager import BackgroundManager
 from code_agent.skill_registry import SkillRegistry
 
 _RESET = "\033[0m"
 _DIM = "\033[2m"
+
+READ_MAX_LINES = 2000
+READ_MAX_BYTES = 50 * 1024
+
+
+def _format_size(size: int) -> str:
+    if size < 1024:
+        return f"{size}B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f}KB"
+    return f"{size / (1024 * 1024):.1f}MB"
+
+
+def _render_read_page(
+    lines: list[str],
+    *,
+    start_line: int,
+) -> tuple[list[str], Literal["lines", "bytes"] | None]:
+    rendered: list[str] = []
+    rendered_bytes = 0
+
+    for index, line in enumerate(lines):
+        if len(rendered) >= READ_MAX_LINES:
+            return rendered, "lines"
+
+        numbered_line = f"{start_line + index:4}| {line}"
+        line_bytes = len(numbered_line.encode("utf-8"))
+        if rendered:
+            line_bytes += 1
+        if rendered_bytes + line_bytes > READ_MAX_BYTES:
+            return rendered, "bytes"
+
+        rendered.append(numbered_line)
+        rendered_bytes += line_bytes
+
+    return rendered, None
 
 
 class Tool(Protocol):
@@ -41,8 +78,16 @@ class TodoWriteArguments(BaseModel):
 
 class ReadArguments(BaseModel):
     path: str
-    offset: int = 0
-    limit: int | None = None
+    offset: int = Field(
+        default=1,
+        ge=1,
+        description="Line number to start reading from (1-indexed)",
+    )
+    limit: int | None = Field(
+        default=None,
+        ge=1,
+        description="Maximum number of lines to read",
+    )
 
 
 class TodoWriteTool:
@@ -66,20 +111,76 @@ class TodoWriteTool:
 class ReadTool:
     type = "function"
     name = "read"
-    description = "Read file with line numbers (file path, not directory)"
+    description = (
+        "Read a text file with line numbers (file path, not directory). Output is "
+        f"truncated to {READ_MAX_LINES} lines or {READ_MAX_BYTES // 1024}KB, "
+        "whichever is reached first. offset is 1-indexed. Use offset/limit for "
+        "large files and continue with the offset given in a truncated result."
+    )
     parameters: ClassVar[dict[str, Any]] = ReadArguments.model_json_schema()
     arguments_model = ReadArguments
 
     async def run(self, arguments: dict[str, Any]) -> str:
         args = self.arguments_model.model_validate(arguments)
-        lines = await asyncio.to_thread(Path(args.path).read_text)
-        lines = lines.splitlines(keepends=True)
-        limit = args.limit if args.limit is not None else len(lines)
-        selected = lines[args.offset : args.offset + limit]
-        return "".join(
-            f"{args.offset + index + 1:4}| {line}"
-            for index, line in enumerate(selected)
+        text = await asyncio.to_thread(Path(args.path).read_text, encoding="utf-8")
+        lines = text.splitlines()
+        total_lines = len(lines)
+        start_index = args.offset - 1
+
+        if start_index >= total_lines:
+            if total_lines == 0 and start_index == 0:
+                return ""
+            raise ValueError(
+                f"Offset {args.offset} is beyond end of file "
+                f"({total_lines} lines total)"
+            )
+
+        end_index = (
+            min(start_index + args.limit, total_lines)
+            if args.limit is not None
+            else total_lines
         )
+        candidate_lines = lines[start_index:end_index]
+        rendered_lines, truncated_by = _render_read_page(
+            candidate_lines,
+            start_line=args.offset,
+        )
+
+        if not rendered_lines and truncated_by == "bytes":
+            line_size = len(candidate_lines[0].encode("utf-8"))
+            quoted_path = shlex.quote(args.path)
+            return (
+                f"[Line {args.offset} is {_format_size(line_size)}, exceeds "
+                f"{_format_size(READ_MAX_BYTES)} limit. Use bash: sed -n "
+                f"'{args.offset}p' {quoted_path} | head -c {READ_MAX_BYTES}]"
+            )
+
+        output = "\n".join(rendered_lines)
+        next_offset = args.offset + len(rendered_lines)
+
+        if truncated_by is not None:
+            end_line = next_offset - 1
+            byte_note = (
+                f" ({_format_size(READ_MAX_BYTES)} limit)"
+                if truncated_by == "bytes"
+                else ""
+            )
+            notice = (
+                f"[Showing lines {args.offset}-{end_line} of {total_lines}"
+                f"{byte_note}. Use offset={next_offset} to continue.]"
+            )
+            return f"{output}\n\n{notice}"
+
+        if end_index < total_lines:
+            remaining = total_lines - end_index
+            line_word = "line" if remaining == 1 else "lines"
+            notice = (
+                f"[{remaining} more {line_word} in file. "
+                f"Use offset={end_index + 1} to continue.]"
+            )
+            return f"{output}\n\n{notice}"
+
+        return output
 
 
 class WriteArguments(BaseModel):
