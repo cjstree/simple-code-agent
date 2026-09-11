@@ -85,6 +85,7 @@ async def run(
         enabled=settings.phoenix_enabled,
         endpoint=settings.phoenix_collector_endpoint,
         project_name=settings.phoenix_project_name,
+        trace_log_dir=settings.trace_log_dir,
     )
     agent: Agent | None = None
 

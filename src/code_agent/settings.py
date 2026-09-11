@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     phoenix_enabled: bool = False
     phoenix_collector_endpoint: str = "http://localhost:6006/v1/traces"
     phoenix_project_name: str = "code-agent-dev"
+    trace_log_dir: Path | None = None
 
     model_config = SettingsConfigDict(
         env_file=(".env", _PROJECT_ROOT / ".env"),

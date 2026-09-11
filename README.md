@@ -26,13 +26,28 @@ MCP integration is optional. Set `MCP_URL` to any Streamable HTTP MCP endpoint,
 for example `http://127.0.0.1:8000/mcp`, to discover and add its remote tools. With
 `MCP_URL` unset, the agent has no runtime dependency on the RAG backend.
 
-Phoenix tracing is also optional:
+Phoenix and local JSONL tracing are optional:
 
 ```bash
 uv sync --extra telemetry
 ```
 
-Then enable `PHOENIX_ENABLED` and configure its endpoint in `.env`.
+Then enable `PHOENIX_ENABLED` and configure its endpoint in `.env`. To export
+spans locally, set `TRACE_LOG_DIR` instead of or in addition to
+`PHOENIX_ENABLED`:
+
+```dotenv
+TRACE_LOG_DIR=artifacts/traces
+```
+
+Completed spans are appended as one compact JSON object per line to
+`trace_log_<session-id>.jsonl`. Each line contains the OpenTelemetry trace/span
+IDs, timestamps, status, attributes, events, and resource fields. The same
+directory also contains `manifest.jsonl`, which maps session IDs to their trace
+files. A multi-turn session appends to one file even though each turn has its own
+trace ID. Writes are synchronous, so line order follows span completion rather
+than span start time; consumers should use timestamps and parent span IDs when
+reconstructing execution order.
 
 ## Validation
 
@@ -86,6 +101,10 @@ PHOENIX_ENABLED=true
 PHOENIX_COLLECTOR_ENDPOINT=http://localhost:6006/v1/traces
 PHOENIX_PROJECT_NAME=code-agent-eval
 ```
+
+也可以通过 `TRACE_LOG_DIR` 在 eval sandbox 中导出相同 span 的本地 JSONL；它不要求
+启用或运行 Phoenix。当前 scorer 不消费这些文件，样例结束后 sandbox 仍会按 Inspect
+生命周期清理。
 
 Inspect 仍负责创建样例工作目录、执行 solver 和运行 pytest scorer，但模型调用、
 token 配置和 Phoenix telemetry 均由 Agent 自己负责。

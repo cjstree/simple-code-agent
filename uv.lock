@@ -2745,7 +2745,9 @@ dependencies = [
 [package.optional-dependencies]
 telemetry = [
     { name = "arize-phoenix-otel" },
+    { name = "openinference-instrumentation" },
     { name = "openinference-instrumentation-openai" },
+    { name = "opentelemetry-sdk" },
 ]
 
 [package.dev-dependencies]
@@ -2763,7 +2765,9 @@ requires-dist = [
     { name = "httpx", extras = ["socks"], specifier = ">=0.28.0" },
     { name = "mcp", specifier = ">=2.0.0" },
     { name = "openai", specifier = ">=1.0.0" },
+    { name = "openinference-instrumentation", marker = "extra == 'telemetry'", specifier = ">=0.1.41" },
     { name = "openinference-instrumentation-openai", marker = "extra == 'telemetry'", specifier = ">=0.1.41" },
+    { name = "opentelemetry-sdk", marker = "extra == 'telemetry'", specifier = ">=1.31.0" },
     { name = "pydantic-settings", specifier = ">=2.0.0" },
     { name = "pyyaml", specifier = ">=6.0.0" },
 ]

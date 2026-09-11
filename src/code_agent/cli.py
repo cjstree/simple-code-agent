@@ -11,6 +11,7 @@ async def _run_cli() -> None:
         enabled=settings.phoenix_enabled,
         endpoint=settings.phoenix_collector_endpoint,
         project_name=settings.phoenix_project_name,
+        trace_log_dir=settings.trace_log_dir,
     )
     cli_agent = Agent(telemetry=telemetry)
     try:

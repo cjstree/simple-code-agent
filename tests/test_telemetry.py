@@ -1,7 +1,11 @@
+import json
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
-from code_agent.telemetry import AgentTelemetry
+import pytest
+
+from code_agent.telemetry import AgentTelemetry, _add_local_span_processor
 
 
 class FakeSpan:
@@ -114,6 +118,99 @@ def test_disabled_telemetry_is_a_noop() -> None:
         enabled=False,
         endpoint="http://localhost:6006/v1/traces",
         project_name="test",
+    )
+
+    with telemetry.trace_turn(session_id="session-1", prompt="hello") as span:
+        span.set_output("world")
+    telemetry.shutdown()
+
+
+def test_local_trace_export_writes_session_jsonl_and_manifest(
+    tmp_path: Path,
+) -> None:
+    # Local-only tracing preserves span relationships and routes a session to one file.
+    pytest.importorskip("opentelemetry.sdk")
+    pytest.importorskip("openinference.instrumentation")
+    pytest.importorskip("openinference.instrumentation.openai")
+    telemetry = AgentTelemetry.initialize(
+        enabled=False,
+        endpoint="http://localhost:6006/v1/traces",
+        project_name="test-project",
+        trace_log_dir=tmp_path,
+    )
+
+    with (
+        telemetry.trace_turn(session_id="session-1", prompt="完整问题"),
+        telemetry.trace_operation(
+            name="session.compact_history",
+            span_kind="chain",
+            input_value={"context_token": 100},
+        ) as span,
+    ):
+        span.set_output("完整摘要")
+    telemetry.shutdown()
+
+    trace_path = tmp_path / "trace_log_session-1.jsonl"
+    records = [json.loads(line) for line in trace_path.read_text().splitlines()]
+    assert [record["name"] for record in records] == [
+        "session.compact_history",
+        "agent.turn",
+    ]
+    assert all(record["schema_version"] == 1 for record in records)
+    assert all(record["attributes"]["session.id"] == "session-1" for record in records)
+    assert records[0]["parent_id"] == records[1]["context"]["span_id"]
+    assert records[0]["resource"]["attributes"]["openinference.project.name"] == (
+        "test-project"
+    )
+
+    manifest = [
+        json.loads(line)
+        for line in (tmp_path / "manifest.jsonl").read_text().splitlines()
+    ]
+    assert manifest == [
+        {
+            "schema_version": 1,
+            "session_id": "session-1",
+            "file": "trace_log_session-1.jsonl",
+        }
+    ]
+
+
+def test_local_processor_preserves_the_phoenix_processor(tmp_path: Path) -> None:
+    # Adding local export must not replace Phoenix's default OTLP processor.
+    pytest.importorskip("opentelemetry.sdk")
+
+    class FakeProvider:
+        def __init__(self) -> None:
+            self.calls: list[tuple[Any, dict[str, Any]]] = []
+
+        def add_span_processor(self, processor: Any, **kwargs: Any) -> None:
+            self.calls.append((processor, kwargs))
+
+    provider = FakeProvider()
+    _add_local_span_processor(
+        provider,
+        tmp_path,
+        preserve_phoenix_processor=True,
+    )
+
+    assert len(provider.calls) == 1
+    assert provider.calls[0][1] == {"replace_default_processor": False}
+
+
+def test_invalid_local_trace_directory_fails_open(tmp_path: Path) -> None:
+    # An unusable local destination leaves agent telemetry as a safe no-op.
+    pytest.importorskip("opentelemetry.sdk")
+    pytest.importorskip("openinference.instrumentation")
+    pytest.importorskip("openinference.instrumentation.openai")
+    not_a_directory = tmp_path / "trace-file"
+    not_a_directory.write_text("occupied", encoding="utf-8")
+
+    telemetry = AgentTelemetry.initialize(
+        enabled=False,
+        endpoint="http://localhost:6006/v1/traces",
+        project_name="test-project",
+        trace_log_dir=not_a_directory,
     )
 
     with telemetry.trace_turn(session_id="session-1", prompt="hello") as span:
