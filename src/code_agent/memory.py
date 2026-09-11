@@ -6,6 +6,7 @@ from pydantic import BaseModel, TypeAdapter
 
 from code_agent import settings
 from code_agent.telemetry import AgentTelemetry
+from code_agent.prompt import _SYS_MEMORY_SELECTOR
 
 
 class ExtractedMemory(BaseModel):
@@ -202,14 +203,14 @@ class Memory :
                     dialogue_parts.append(f"{role}: {content}")
             dialogue = "\n".join(dialogue_parts)
 
-            prompt = (f"Select relevant memory indices.\n"
-                      f"Return only a JSON array of catalog indices, such as [0, 2].\n"
-                      f"Return [] when none are relevant.\n\n"
-                      f"Recent conversation:\n{dialogue}\n\nMemory catalog:\n{catalog}")
+            prompt = f"Recent conversation:\n{dialogue}\n\nMemory catalog:\n{catalog}"
+            
             try:
                 completion = await self.client.chat.completions.create(
                     model=settings.settings.llm_model_name,
-                    messages=[{"role": "user", "content": prompt}],
+                    messages=[
+                        {"role":"system","content":_SYS_MEMORY_SELECTOR},
+                        {"role": "user", "content": prompt}],
                     max_tokens=settings.settings.llm_max_tokens,
                     temperature=settings.settings.llm_temperature,
                 )

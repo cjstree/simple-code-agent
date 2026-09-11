@@ -145,9 +145,11 @@ async def test_select_relevant_memories_returns_bodies_in_selected_order(
     assert selected == ["Zeta body", "Alpha body"]
     assert len(client.completions.calls) == 1
     request = client.completions.calls[0]
-    assert request["messages"][0]["role"] == "user"
-    assert "What conventions should I follow?" in request["messages"][0]["content"]
-    assert "[0]:[Alpha](alpha.md)" in request["messages"][0]["content"]
+    assert request["messages"][0]["role"] == "system"
+    assert "memory selector" in request["messages"][0]["content"]
+    assert request["messages"][1]["role"] == "user"
+    assert "What conventions should I follow?" in request["messages"][1]["content"]
+    assert "[0]:[Alpha](alpha.md)" in request["messages"][1]["content"]
     name, span_kind, input_value, span = telemetry.operations[0]
     assert name == "memory.select_relevant"
     assert span_kind == "retriever"

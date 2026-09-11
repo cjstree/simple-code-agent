@@ -254,9 +254,17 @@ async def test_agent_uses_session_for_request_and_response_messages(
     async def extract_memories(messages: list[dict[str, Any]]) -> None:
         return None
 
+    async def select_relevant_memories(
+        messages: list[dict[str, Any]],
+    ) -> list[str]:
+        return []
+
     try:
         await agent.start()
-        agent.memory = SimpleNamespace(extract_memories=extract_memories)
+        agent.memory = SimpleNamespace(
+            extract_memories=extract_memories,
+            select_relevant_memories=select_relevant_memories,
+        )
         monkeypatch.setattr(agent, "_call_api", call_api)
 
         result = await agent.run("hello")
@@ -947,10 +955,10 @@ async def test_agent_stops_after_maximum_tool_rounds_with_result_recorded(
 
 
 @pytest.mark.asyncio
-async def test_agent_builds_dynamic_system_prompt_from_skills_and_memory(
+async def test_agent_builds_dynamic_system_prompt_and_injects_memory(
     tmp_path: Path,
 ) -> None:
-    # Dynamic prompts expose registered skills and selected memory to the model.
+    # Skills remain in the stable system prompt while memory becomes user context.
     selected_contexts: list[list[dict[str, Any]]] = []
     agent = Agent(telemetry=AgentTelemetry())
     skill_dir = tmp_path / "reviewing"
@@ -975,11 +983,21 @@ async def test_agent_builds_dynamic_system_prompt_from_skills_and_memory(
     agent.memory = SimpleNamespace(select_relevant_memories=select_relevant_memories)
 
     await agent.build_system()
+    await agent.inject_memory()
 
     prompt = agent.session.system_prompt
     assert selected_contexts[0][-1] == {"role": "user", "content": "review this"}
     assert "- **reviewing**: Review Python code" in prompt
-    assert "<memory>\nPrefer focused tests.\n</memory>" in prompt
+    assert "<memory>" not in prompt
+    assert agent.session.build_context()[-1] == {
+        "role": "user",
+        "content": (
+            "Potentially relevant memory:\n"
+            "<memory>\nPrefer focused tests.\n</memory>\n\n"
+            "The current user request and conversation context take priority over "
+            "recalled memory."
+        ),
+    }
 
 
 @pytest.mark.asyncio
