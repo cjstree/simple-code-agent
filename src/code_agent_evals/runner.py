@@ -8,6 +8,7 @@ from contextlib import redirect_stdout
 from code_agent.agent import Agent
 from code_agent.settings import settings
 from code_agent.telemetry import AgentTelemetry
+from code_agent_evals.trace import TRACE_DIRECTORY
 
 _SESSION_CONFIG_FIELDS = {
     "compact_thresh_hold",
@@ -85,7 +86,7 @@ async def run(
         enabled=settings.phoenix_enabled,
         endpoint=settings.phoenix_collector_endpoint,
         project_name=settings.phoenix_project_name,
-        trace_log_dir=settings.trace_log_dir,
+        trace_log_dir=TRACE_DIRECTORY,
     )
     agent: Agent | None = None
 

@@ -180,11 +180,17 @@ async def test_runner_executes_turns_in_one_agent_session(monkeypatch) -> None:
             self.closed = True
 
     telemetry = SimpleNamespace(shutdown=lambda: None)
+    telemetry_settings = []
+
+    def initialize_telemetry(**kwargs):
+        telemetry_settings.append(kwargs)
+        return telemetry
+
     monkeypatch.setattr(runner, "Agent", FakeAgent)
     monkeypatch.setattr(
         runner,
         "AgentTelemetry",
-        SimpleNamespace(initialize=lambda **kwargs: telemetry),
+        SimpleNamespace(initialize=initialize_telemetry),
     )
 
     result = await runner.run(
@@ -199,6 +205,7 @@ async def test_runner_executes_turns_in_one_agent_session(monkeypatch) -> None:
     ]
     assert agents[0].session.compact_thresh_hold == 500
     assert agents[0].closed is True
+    assert telemetry_settings[0]["trace_log_dir"].as_posix() == ".eval_traces"
 
 
 @pytest.mark.asyncio
