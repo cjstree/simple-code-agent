@@ -43,9 +43,7 @@ def _jsonl(*records: dict) -> str:
 
 
 def _manifest(filename: str = "trace_log_session-1.jsonl") -> str:
-    return _jsonl(
-        {"schema_version": 1, "session_id": "session-1", "file": filename}
-    )
+    return _jsonl({"schema_version": 1, "session_id": "session-1", "file": filename})
 
 
 def test_trace_parser_reconstructs_turns_from_completion_order() -> None:
@@ -71,9 +69,7 @@ def test_trace_parser_reconstructs_turns_from_completion_order() -> None:
         _span("agent.turn", "turn-1", start_second=1, kind="agent"),
     )
 
-    trace = parse_trace_jsonl(
-        _manifest(), {"trace_log_session-1.jsonl": content}
-    )
+    trace = parse_trace_jsonl(_manifest(), {"trace_log_session-1.jsonl": content})
     session = trace.session("session-1")
 
     assert [turn.span.span_id for turn in session.turns] == ["turn-1", "turn-2"]
@@ -82,9 +78,7 @@ def test_trace_parser_reconstructs_turns_from_completion_order() -> None:
         "llm-1",
         "tool-1",
     ]
-    assert session.turn(2).compact_history_spans[0].output_value == (
-        "summary MARKER-7"
-    )
+    assert session.turn(2).compact_history_spans[0].output_value == ("summary MARKER-7")
     assert session.turn(2).tool_spans[0].span_id == "tool-1"
     assert len(session.compact_history_between(1, 2)) == 1
 
@@ -137,6 +131,75 @@ def test_evaluation_trace_orders_turns_across_restarted_sessions() -> None:
     assert len(trace.compact_history_between(1, 2)) == 1
 
 
+def test_trace_parser_skips_unscoped_startup_span_in_unknown_file() -> None:
+    # MCP initialization happens before trace_turn supplies a session id.
+    manifest = _jsonl(
+        {
+            "schema_version": 1,
+            "session_id": "unknown",
+            "file": "trace_log_unknown.jsonl",
+        },
+        {
+            "schema_version": 1,
+            "session_id": "session-1",
+            "file": "trace_log_session-1.jsonl",
+        },
+    )
+    startup = _span("MCP send initialize", "startup", start_second=1)
+    startup["attributes"].pop("session.id")
+    trace = parse_trace_jsonl(
+        manifest,
+        {
+            "trace_log_unknown.jsonl": _jsonl(startup),
+            "trace_log_session-1.jsonl": _jsonl(
+                _span("agent.turn", "turn-1", start_second=2, kind="agent")
+            ),
+        },
+    )
+
+    assert list(trace.sessions) == ["session-1"]
+    assert trace.turn(1).span.span_id == "turn-1"
+
+
+@pytest.mark.parametrize(
+    "name", ["agent.turn", "session.compact_history", "tool.read_file"]
+)
+def test_trace_parser_does_not_skip_unscoped_scoring_span(name: str) -> None:
+    span = _span(
+        name,
+        "unscoped",
+        start_second=1,
+        kind="tool" if name.startswith("tool.") else "chain",
+    )
+    span["attributes"].pop("session.id")
+    manifest = _jsonl(
+        {
+            "schema_version": 1,
+            "session_id": "unknown",
+            "file": "trace_log_unknown.jsonl",
+        }
+    )
+
+    with pytest.raises(TraceFormatError, match="session.id does not match"):
+        parse_trace_jsonl(manifest, {"trace_log_unknown.jsonl": _jsonl(span)})
+
+
+def test_trace_parser_still_validates_unscoped_startup_span() -> None:
+    span = _span("MCP send initialize", "startup", start_second=1)
+    span["attributes"].pop("session.id")
+    span["start_time"] = "bad timestamp"
+    manifest = _jsonl(
+        {
+            "schema_version": 1,
+            "session_id": "unknown",
+            "file": "trace_log_unknown.jsonl",
+        }
+    )
+
+    with pytest.raises(TraceFormatError, match="ISO-8601 timestamp"):
+        parse_trace_jsonl(manifest, {"trace_log_unknown.jsonl": _jsonl(span)})
+
+
 @pytest.mark.parametrize(
     ("manifest", "files", "message"),
     [
@@ -171,9 +234,7 @@ def test_trace_parser_rejects_unbound_scoring_span() -> None:
     )
 
     with pytest.raises(TraceFormatError, match="not bound to an agent.turn"):
-        parse_trace_jsonl(
-            _manifest(), {"trace_log_session-1.jsonl": content}
-        )
+        parse_trace_jsonl(_manifest(), {"trace_log_session-1.jsonl": content})
 
 
 @pytest.mark.asyncio

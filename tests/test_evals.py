@@ -12,9 +12,15 @@ from code_agent_evals import runner
 from code_agent_evals import scorer as eval_scorer
 from code_agent_evals import solver as eval_solver
 from code_agent_evals.runner import apply_agent_config, parse_payload
-from code_agent_evals.scorer import evaluation_contract, score_tests
+from code_agent_evals.scorer import (
+    evaluation_contract,
+    preservation_checks,
+    preservation_trace_result,
+    score_tests,
+)
 from code_agent_evals.solver import _runner_payload
-from code_agent_evals.tasks import basic_agent_eval
+from code_agent_evals.tasks import basic_agent_eval, context_survival_eval
+from code_agent_evals.trace import parse_trace_jsonl
 
 
 def test_basic_agent_eval_uses_isolated_file_fixture() -> None:
@@ -152,6 +158,34 @@ async def test_solver_runs_agent_without_bridge_or_llm_overrides(monkeypatch) ->
         )
     ]
     assert state.output.completion == "final answer"
+
+
+@pytest.mark.asyncio
+async def test_solver_uses_sample_timeout_without_forwarding_it(monkeypatch) -> None:
+    # A long sample gets more runner time while the Agent receives only its turns.
+    calls = []
+
+    class FakeSandbox:
+        async def exec(self, command, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(success=True, stdout="done", stderr="")
+
+    monkeypatch.setattr(eval_solver, "sandbox", lambda: FakeSandbox())
+    sample = next(iter(context_survival_eval().dataset))
+    state = SimpleNamespace(
+        input_text=sample.input, metadata=sample.metadata, output=None
+    )
+
+    await eval_solver.my_agent_solver()(state, None)
+
+    assert calls[0]["timeout"] == sample.metadata["runner_timeout_seconds"]
+    assert "runner_timeout_seconds" not in json.loads(calls[0]["input"])
+    assert state.output.completion == "done"
+    for invalid in (0, True, "720"):
+        state.metadata = {"runner_timeout_seconds": invalid}
+        with pytest.raises(ValueError, match="positive integer"):
+            await eval_solver.my_agent_solver()(state, None)
+    assert len(calls) == 1
 
 
 # The first turn creates the eval session and every later turn reuses it; the
@@ -669,3 +703,240 @@ def test_reference_patches_satisfy_visible_and_hidden_contracts(tmp_path) -> Non
             check=False,
         )
         assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_constraint_sample_declares_isolated_scoring_contract() -> None:
+    # Three distinct constraints are scored on an isolated input fixture.
+    samples = list(context_survival_eval().dataset)
+    assert len(samples) == 1
+    sample = samples[0]
+    assert sample.id == "constraint_rollback_compatibility"
+    checks = preservation_checks(sample.metadata)
+    assert checks is not None and [check.id for check in checks] == [
+        "C-11",
+        "C-12",
+        "C-13",
+    ]
+    assert all(check.category == "constraint" for check in checks)
+    assert all(check.min_compact_hops == 2 for check in checks)
+    assert [check.introduced_turn for check in checks] == [1, 1, 2]
+    payload = json.loads(
+        _runner_payload(
+            SimpleNamespace(input_text=sample.input, metadata=sample.metadata)
+        )
+    )
+    assert "context_survival" not in payload
+    assert payload["agent_config"] == {
+        "compact_thresh_hold": 4_000,
+        "reserved_token": 700,
+        "max_tool_res": 3,
+    }
+    turns = payload["turns"]
+    assert 9 <= len(turns) <= 11
+    assert all(check.used_turn == len(turns) for check in checks)
+    assert [index for index, turn in enumerate(turns, 1) if "C-11" in turn] == [1]
+    assert [index for index, turn in enumerate(turns, 1) if "C-12" in turn] == [1]
+    assert [index for index, turn in enumerate(turns, 1) if "C-13" in turn] == [2]
+    assert Path(sample.files["."]).name == "constraint_rollback_compatibility"
+
+
+def test_constraint_fixture_regressions_and_reference_patch(tmp_path) -> None:
+    # Every declared constraint catches a baseline failure; the reference fixes all.
+    sample = next(iter(context_survival_eval().dataset))
+    workspace = tmp_path / str(sample.id)
+    shutil.copytree(Path(sample.files["."]), workspace)
+    project_root = Path(__file__).resolve().parents[1]
+    shutil.copytree(
+        project_root / "evals" / "hidden_tests" / str(sample.id),
+        workspace / ".eval_hidden_tests",
+    )
+    checks = preservation_checks(sample.metadata)
+    assert checks is not None
+    environment = {
+        **os.environ,
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONPATH": str(workspace),
+    }
+
+    def run_tests(selectors):
+        return subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", *selectors],
+            cwd=workspace,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    for check in checks:
+        baseline = run_tests(check.behavior_tests)
+        assert baseline.returncode == 1, (check.id, baseline.stdout, baseline.stderr)
+
+    patch = project_root / "evals" / sample.metadata["reference_patch"]
+    applied = subprocess.run(
+        ["git", "apply", str(patch)],
+        cwd=workspace,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+
+    selectors = tuple(selector for check in checks for selector in check.behavior_tests)
+    reference = run_tests(selectors)
+    assert reference.returncode == 0, reference.stdout + reference.stderr
+
+    service = workspace / "deployment_service.py"
+    source = service.read_text()
+    assert source.count("reason: str) -> Deployment:") == 1
+    service.write_text(
+        source.replace(
+            "reason: str) -> Deployment:", "reason: str = 'unspecified') -> Deployment:"
+        )
+    )
+    signature_regression = run_tests(
+        (
+            ".eval_hidden_tests/test_constraint_regression.py::test_rollback_signature_stays_compatible",
+        )
+    )
+    assert signature_regression.returncode == 1, (
+        signature_regression.stdout + signature_regression.stderr
+    )
+    locally_passing = run_tests(("tests/test_rollback.py",))
+    assert locally_passing.returncode == 0, (
+        locally_passing.stdout + locally_passing.stderr
+    )
+
+
+@pytest.mark.parametrize(
+    ("summaries", "expected"),
+    [
+        (["C-11 C-12 C-13", "C-11 C-12 C-13"], (True, True, 2)),
+        (["C-11 C-12 C-13", "C-12 C-13"], (True, False, 2)),
+        (["C-11 C-12 C-13"], (False, False, 1)),
+    ],
+)
+def test_preservation_trace_requires_two_marked_compactions(
+    summaries, expected
+) -> None:
+    # A missing marker or compact hop fails the first constraint's trace gate.
+    sample = next(iter(context_survival_eval().dataset))
+    check = preservation_checks(sample.metadata)[0]
+    spans = []
+    for ordinal in range(1, check.used_turn + 1):
+        spans.append(
+            {
+                "schema_version": 1,
+                "name": "agent.turn",
+                "context": {"trace_id": "trace", "span_id": f"turn-{ordinal}"},
+                "parent_id": None,
+                "start_time": f"2026-09-14T00:{ordinal:02d}:00Z",
+                "end_time": f"2026-09-14T00:{ordinal:02d}:05Z",
+                "attributes": {"session.id": "session"},
+            }
+        )
+    for index, summary in enumerate(summaries):
+        spans.append(
+            {
+                "schema_version": 1,
+                "name": "session.compact_history",
+                "context": {"trace_id": "trace", "span_id": f"compact-{index}"},
+                "parent_id": f"turn-{index + 3}",
+                "start_time": f"2026-09-14T00:{index + 3:02d}:01Z",
+                "end_time": f"2026-09-14T00:{index + 3:02d}:02Z",
+                "attributes": {"session.id": "session", "output.value": summary},
+            }
+        )
+    trace = parse_trace_jsonl(
+        json.dumps(
+            {"schema_version": 1, "session_id": "session", "file": "trace.jsonl"}
+        ),
+        {"trace.jsonl": "\n".join(json.dumps(span) for span in reversed(spans))},
+    )
+    assert preservation_trace_result(check, trace) == expected
+
+
+@pytest.mark.asyncio
+async def test_context_survival_score_requires_trace_and_behavior(monkeypatch) -> None:
+    # Each constraint combines compact evidence with its own behavior tests.
+    sample = next(iter(context_survival_eval().dataset))
+    metadata = sample.metadata
+
+    class FakeSandbox:
+        def __init__(self):
+            self.failed_selectors = set()
+            self.commands = []
+
+        async def write_file(self, path, contents):
+            return None
+
+        async def exec(self, command, **kwargs):
+            self.commands.append(command)
+            return SimpleNamespace(
+                success=command[-1] not in self.failed_selectors,
+                stdout="test result",
+                stderr="",
+            )
+
+    spans = [SimpleNamespace(output_value="C-11 C-12 C-13 retained") for _ in range(2)]
+
+    async def read_trace(_environment):
+        return SimpleNamespace(compact_history_between=lambda start, end: spans)
+
+    monkeypatch.setattr(eval_scorer, "read_trace_input", read_trace)
+    state = SimpleNamespace(sample_id=sample.id, metadata=metadata)
+    environment = FakeSandbox()
+
+    passing = await score_tests(state, environment)
+    assert passing.value == 1
+    checks = passing.metadata["context_survival"]["checks"]
+    assert [check["id"] for check in checks] == ["C-11", "C-12", "C-13"]
+    check = checks[0]
+    assert passing.metadata["context_survival"]["strict_pass"] is True
+    assert check["score"] == 1
+    assert check["activation"] == {
+        "passed": True,
+        "score": 0.25,
+        "compact_hops": 2,
+        "min_compact_hops": 2,
+    }
+    assert check["trace_preserved"] == {"passed": True, "score": 0.25}
+    assert check["behavior"]["score"] == 0.5
+    assert check["behavior"]["tests_total"] == 2
+    assert len(environment.commands) == 7
+    assert all(len(command) == 5 for command in environment.commands)
+
+    spans.pop()
+    inactive = await score_tests(state, environment)
+    assert inactive.value == 0.5
+    assert all(
+        not check["activation"]["passed"]
+        and check["trace_preserved"]["score"] == 0
+        and not check["strict_pass"]
+        for check in inactive.metadata["context_survival"]["checks"]
+    )
+
+    spans.append(SimpleNamespace(output_value="C-11 C-12 C-13 retained"))
+    failed_selector = preservation_checks(metadata)[0].behavior_tests[0]
+    environment.failed_selectors = {failed_selector}
+    failed_behavior = await score_tests(state, environment)
+    assert failed_behavior.value == pytest.approx(11 / 12)
+    failed_check = failed_behavior.metadata["context_survival"]["checks"][0]
+    assert failed_check["strict_pass"] is False
+    assert failed_check["behavior"]["score"] == 0.25
+    assert failed_check["behavior"]["tests_passed"] == 1
+    assert failed_check["behavior"]["tests_total"] == 2
+    assert failed_check["behavior"]["tests"][0] == {
+        "selector": failed_selector,
+        "passed": False,
+    }
+
+    environment.failed_selectors = set()
+    spans[1] = SimpleNamespace(output_value="C-11 C-13 retained")
+    missing_marker = await score_tests(state, environment)
+    assert missing_marker.value == pytest.approx(11 / 12)
+    assert [
+        item["trace_preserved"]["passed"]
+        for item in missing_marker.metadata["context_survival"]["checks"]
+    ] == [True, False, True]
+    assert missing_marker.metadata["context_survival"]["strict_pass"] is False

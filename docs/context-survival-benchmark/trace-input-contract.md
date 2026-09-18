@@ -43,6 +43,11 @@ JSONL 由 completed span exporter 写出，子 span 通常先于父 span落盘�
 执行顺序。解析器先读取完整 session，再按 `(start_time, end_time, span_id)` 稳定排序，
 并使用同一 `trace_id` 下的 `parent_id` 祖先链把 span 绑定到 `agent.turn`。
 
+Agent turn 开始前的 MCP 初始化等自动埋点可能没有 `session.id`，exporter 会把它们写入
+manifest 中的 `unknown` 文件。读取器验证这些 span 的格式后跳过它们；它们不参与 turn
+重建和评分。此例外仅适用于 `unknown` 文件中缺少 `session.id` 的非 agent turn、非
+compact、非 tool span。评分相关 span 缺少 session 仍属于 trace 格式错误。
+
 以下情况抛出 `TraceInputError`，调用方应归类为评测基础设施失败，而不是普通零分：
 
 - manifest 或引用文件缺失（`TraceUnavailableError`）；

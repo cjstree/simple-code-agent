@@ -25,6 +25,10 @@
 
 契约描述检查 ID、类别、信息引入和使用 turn、最少 compact hop、trace 断言和行为测试。
 
+混合分采用 [README 的评分规则（版本 1）](README.md#评分规则版本-1)：compact 激活
+占 0.25、summary 留存占 0.25、逐项行为测试占 0.50。`Score.value` 是各 check 的
+平均混合分；`strict_pass` 独立记录，只有三类证据全部满足才为 true。
+
 ## 验收标准
 
 - 合成 trace 测试覆盖正常、损坏、缺失、按完成顺序写入以及 compact 绑定错误的情况。

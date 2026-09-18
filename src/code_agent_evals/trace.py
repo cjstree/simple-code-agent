@@ -104,7 +104,9 @@ class SessionTrace:
     ) -> tuple[TraceSpan, ...]:
         """Return history compactions after introduction and through use."""
         if introduced_turn < 1 or used_turn <= introduced_turn:
-            raise ValueError("turn window must satisfy 1 <= introduced_turn < used_turn")
+            raise ValueError(
+                "turn window must satisfy 1 <= introduced_turn < used_turn"
+            )
         self.turn(introduced_turn)
         self.turn(used_turn)
         return tuple(
@@ -125,11 +127,7 @@ class EvaluationTrace:
         """Return turns across all sessions in timestamp order."""
         return tuple(
             sorted(
-                (
-                    turn
-                    for session in self.sessions.values()
-                    for turn in session.turns
-                ),
+                (turn for session in self.sessions.values() for turn in session.turns),
                 key=lambda turn: _span_sort_key(turn.span),
             )
         )
@@ -146,7 +144,9 @@ class EvaluationTrace:
     ) -> tuple[TraceSpan, ...]:
         """Return history compactions in a global, possibly cross-session window."""
         if introduced_turn < 1 or used_turn <= introduced_turn:
-            raise ValueError("turn window must satisfy 1 <= introduced_turn < used_turn")
+            raise ValueError(
+                "turn window must satisfy 1 <= introduced_turn < used_turn"
+            )
         self.turn(introduced_turn)
         self.turn(used_turn)
         return tuple(
@@ -193,7 +193,9 @@ def _timestamp(record: Mapping[str, Any], key: str, source: str) -> datetime:
     try:
         parsed = datetime.fromisoformat(value)
     except ValueError as error:
-        raise TraceFormatError(f"{source}: {key} is not an ISO-8601 timestamp") from error
+        raise TraceFormatError(
+            f"{source}: {key} is not an ISO-8601 timestamp"
+        ) from error
     if parsed.tzinfo is None:
         raise TraceFormatError(f"{source}: {key} must include a timezone")
     return parsed
@@ -209,7 +211,11 @@ def _manifest_filename(value: Any, source: str) -> str:
 
 
 def _parse_span(
-    record: dict[str, Any], *, expected_session_id: str, source: str
+    record: dict[str, Any],
+    *,
+    expected_session_id: str,
+    source: str,
+    allow_unscoped: bool = False,
 ) -> TraceSpan:
     if record.get("schema_version") != TRACE_SCHEMA_VERSION:
         raise TraceFormatError(
@@ -223,12 +229,16 @@ def _parse_span(
     span_id = _required_string(context, "span_id", source)
     parent_id = record.get("parent_id")
     if parent_id is not None and (not isinstance(parent_id, str) or not parent_id):
-        raise TraceFormatError(f"{source}: parent_id must be null or a non-empty string")
+        raise TraceFormatError(
+            f"{source}: parent_id must be null or a non-empty string"
+        )
     attributes = record.get("attributes")
     if not isinstance(attributes, dict):
         raise TraceFormatError(f"{source}: attributes must be an object")
     session_id = attributes.get("session.id")
-    if session_id != expected_session_id:
+    if session_id != expected_session_id and not (
+        allow_unscoped and session_id is None
+    ):
         raise TraceFormatError(
             f"{source}: span session.id does not match manifest session_id"
         )
@@ -237,7 +247,7 @@ def _parse_span(
     if end_time < start_time:
         raise TraceFormatError(f"{source}: end_time precedes start_time")
     return TraceSpan(
-        session_id=session_id,
+        session_id=expected_session_id,
         name=name,
         trace_id=trace_id,
         span_id=span_id,
@@ -280,9 +290,7 @@ def _build_session(
     if not turn_spans:
         raise TraceFormatError(f"{filename}: session has no agent.turn span")
     turn_keys = {(span.trace_id, span.span_id) for span in turn_spans}
-    descendants: dict[tuple[str, str], list[TraceSpan]] = {
-        key: [] for key in turn_keys
-    }
+    descendants: dict[tuple[str, str], list[TraceSpan]] = {key: [] for key in turn_keys}
 
     for span in spans:
         if (span.trace_id, span.span_id) in turn_keys:
@@ -333,6 +341,7 @@ def parse_trace_jsonl(
     """Parse exporter JSONL without relying on record completion order."""
     manifest_records = _parse_jsonl(manifest_jsonl, TRACE_MANIFEST)
     sessions: dict[str, SessionTrace] = {}
+    seen_sessions: set[str] = set()
     used_files: set[str] = set()
     for line_number, record in enumerate(manifest_records, start=1):
         source = f"{TRACE_MANIFEST}:{line_number}"
@@ -342,7 +351,7 @@ def parse_trace_jsonl(
             )
         session_id = _required_string(record, "session_id", source)
         filename = _manifest_filename(record.get("file"), source)
-        if session_id in sessions:
+        if session_id in seen_sessions:
             raise TraceFormatError(f"{source}: duplicate session_id {session_id!r}")
         if filename in used_files:
             raise TraceFormatError(f"{source}: trace file is referenced more than once")
@@ -352,9 +361,32 @@ def parse_trace_jsonl(
             raise TraceUnavailableError(
                 f"manifest references missing trace file {filename!r}"
             ) from error
-        sessions[session_id] = _build_session(
-            session_id, filename, _parse_jsonl(content, filename)
-        )
+        records = _parse_jsonl(content, filename)
+        if session_id == "unknown":
+            scoped_records = []
+            for span_line, span_record in enumerate(records, start=1):
+                attributes = span_record.get("attributes")
+                unscoped = (
+                    isinstance(attributes, dict)
+                    and attributes.get("session.id") is None
+                    and span_record.get("name")
+                    not in _SCORING_SPAN_NAMES | {"agent.turn"}
+                    and not str(span_record.get("name", "")).startswith("tool.")
+                    and attributes.get("openinference.span.kind") != "tool"
+                )
+                if unscoped:
+                    _parse_span(
+                        span_record,
+                        expected_session_id=session_id,
+                        source=f"{filename}:{span_line}",
+                        allow_unscoped=True,
+                    )
+                else:
+                    scoped_records.append(span_record)
+            records = scoped_records
+        if records:
+            sessions[session_id] = _build_session(session_id, filename, records)
+        seen_sessions.add(session_id)
         used_files.add(filename)
     return EvaluationTrace(sessions=MappingProxyType(sessions))
 
@@ -368,7 +400,9 @@ async def read_trace_input(
     try:
         manifest = await environment.read_file(manifest_path)
     except Exception as error:
-        raise TraceUnavailableError(f"trace manifest is unavailable: {manifest_path}") from error
+        raise TraceUnavailableError(
+            f"trace manifest is unavailable: {manifest_path}"
+        ) from error
 
     records = _parse_jsonl(manifest, TRACE_MANIFEST)
     files: dict[str, str] = {}

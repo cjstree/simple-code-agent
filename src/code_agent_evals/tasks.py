@@ -17,3 +17,13 @@ def basic_agent_eval():
         scorer=tests_pass(),
         sandbox="local",
     )
+
+
+@task
+def context_survival_eval():
+    return Task(
+        dataset=json_dataset(str(_PROJECT_ROOT / "evals/context_survival.jsonl")),
+        solver=my_agent_solver(),
+        scorer=tests_pass(),
+        sandbox="local",
+    )

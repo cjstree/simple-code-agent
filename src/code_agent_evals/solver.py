@@ -5,6 +5,8 @@ from inspect_ai.model import ModelOutput
 from inspect_ai.solver import Generate, Solver, TaskState, solver
 from inspect_ai.util import sandbox
 
+_DEFAULT_RUNNER_TIMEOUT_SECONDS = 300
+
 
 def _runner_payload(state: TaskState) -> str:
     """Serialize one or more user turns for the evaluation runner."""
@@ -29,11 +31,16 @@ def my_agent_solver() -> Solver:
         generate: Generate,
     ) -> TaskState:
         del generate
+        timeout = (state.metadata or {}).get(
+            "runner_timeout_seconds", _DEFAULT_RUNNER_TIMEOUT_SECONDS
+        )
+        if type(timeout) is not int or timeout <= 0:
+            raise ValueError("runner_timeout_seconds must be a positive integer")
 
         result = await sandbox().exec(
             [sys.executable, "-m", "code_agent_evals.runner"],
             input=_runner_payload(state),
-            timeout=300,
+            timeout=timeout,
         )
 
         if not result.success:
