@@ -7,6 +7,7 @@
 `resolve_route(target)`、被 resolver 使用的目录，以及管理界面的选择列表。
 目录已有正常工作的 APAC／`line-c` 路由；EU、US 的 bucket 仍是占位值，
 `line-a`、`line-b` 还未绑定。未知名字已抛出 `KeyError`。
+fixture 还包含管理界面的库存查询和目录诊断路径，供探索时区分不同用途。
 
 | 检查 | 声明轮 | 目标与 alias | bucket |
 | --- | ---: | --- | --- |
@@ -25,7 +26,9 @@
 同时检查规范名和 alias 返回精确的 `target_id` 与 bucket。`E-31` 的可见
 PASS_TO_PASS 检查未知名字仍抛 `KeyError`，隐藏测试检查 APAC 路由不变；
 `E-32` 的隐藏 PASS_TO_PASS 检查直接使用规范名时目标 ID 不变，可见测试检查
-管理界面仍提供分别排序的选择列表。初始 fixture 的 FAIL_TO_PASS 逐项失败、
+管理界面仍提供分别排序的选择列表。新增相邻路径有独立可见测试，
+不改变 preserve check 的评分 selector。
+初始 fixture 的 FAIL_TO_PASS 逐项失败、
 PASS_TO_PASS 逐项通过；参考 patch 应全部通过。交换两个 alias 的错误修法会被
 隐藏测试抓住。
 

@@ -91,6 +91,64 @@ def test_write_memory_file_creates_file_and_catalog(tmp_path) -> None:
     )
 
 
+@pytest.mark.asyncio
+async def test_extract_memories_sanitizes_path_in_name(tmp_path) -> None:
+    # A model-provided path stays inside the memory directory as one file.
+    memory_dir = tmp_path / "memories"
+    client = FakeClient(
+        json.dumps(
+            [
+                {
+                    "name": "no-test/config-scaffolding",
+                    "type": "project",
+                    "description": "Test configuration convention",
+                    "body": "Keep the configuration consistent.",
+                }
+            ]
+        )
+    )
+    memory = Memory(memory_dir, client)  # type: ignore[arg-type]
+
+    await memory.extract_memories([{"role": "user", "content": "Remember this."}])
+
+    assert (memory_dir / "no-test-config-scaffolding.md").read_text(
+        encoding="utf-8"
+    ) == memory_file(
+        "no-test/config-scaffolding",
+        "Test configuration convention",
+        "project",
+        "Keep the configuration consistent.",
+    )
+    assert not (memory_dir / "no-test").exists()
+    assert "(no-test-config-scaffolding.md)" in (
+        memory_dir / "MEMORY.md"
+    ).read_text(encoding="utf-8")
+    prompt = client.completions.calls[0]["messages"][0]["content"]
+    assert "lowercase ASCII letters, digits, and hyphens" in prompt
+    assert "Do not include slashes" in prompt
+
+
+def test_write_memory_file_handles_unusable_names(tmp_path) -> None:
+    # Traversal and punctuation-only names cannot escape or break storage.
+    memory_dir = tmp_path / "memories"
+    memory = Memory(memory_dir, FakeClient())  # type: ignore[arg-type]
+
+    memory.write_memory_file("../outside", "project", "A", "First")
+    memory.write_memory_file("...", "project", "B", "Second")
+    memory.write_memory_file("A" * 500, "project", "C", "Third")
+
+    assert (memory_dir / "outside.md").is_file()
+    assert not (tmp_path / "outside.md").exists()
+    files = sorted(memory_dir.glob("*.md"))
+    assert len(files) == 4
+    assert all(len(path.name) <= 103 for path in files)
+    assert "Second" in next(
+        path.read_text(encoding="utf-8")
+        for path in files
+        if path.name.startswith("memory-")
+    )
+
+
 # Scenario: rebuilding the catalog sorts memory files and excludes MEMORY.md.
 def test_rebuild_index_is_sorted_and_excludes_catalog(tmp_path) -> None:
     memory_dir = tmp_path / "memories"

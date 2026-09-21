@@ -162,6 +162,11 @@ type: project
 Memory content used by the Agent.
 ```
 
+Agent 提取新 memory 时会要求模型使用小写英文字母、数字和连字符命名。
+写入前仍会把名称转换为单层安全文件名：路径分隔符等字符变为连字符，
+完全没有英文字母或数字的名称使用稳定的哈希文件名。原始名称保留在
+frontmatter 中，索引指向转换后的文件名。
+
 ### 在 JSONL 中注册样例
 
 在 `evals/file_edit.jsonl` 追加一行 JSON：

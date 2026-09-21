@@ -5,6 +5,7 @@
 这个原子样例检查 Agent 在 compact 后采用最新决定，同时保留未被更新的决定。
 独立 fixture 的两个公开发布构建函数通过 `release_policy.policy_for` 读取策略。
 旁边还有使用同一策略表、但不发布为 release 的 draft preview 构建函数。
+fixture 还包含历史清单和多来源清单视图，供探索时区分不同路径。
 初始普通发布和 hotfix 都使用旧 channel、空 marker；preview 原本正确地使用
 `pilot`。可见测试不写出最终发布取值；参考 patch 只修改策略表中普通发布和
 hotfix 的两行。
@@ -25,7 +26,9 @@ draft preview、分析误用 preview 策略的候选方案、检查版本传递�
 精确使用更新值；可见 PASS_TO_PASS 检查传入版本与 preview 的既有策略不变。
 `D-22` 的可见 FAIL_TO_PASS
 检查 marker 非空，隐藏测试检查普通 channel 和两个清单的 marker；可见
-PASS_TO_PASS 检查普通清单的版本不变。初始 fixture 的 FAIL_TO_PASS 逐项失败、
+PASS_TO_PASS 检查普通清单的版本不变。新增相邻路径有独立可见测试，
+不改变 preserve check 的评分 selector。
+初始 fixture 的 FAIL_TO_PASS 逐项失败、
 PASS_TO_PASS 逐项通过；参考 patch 应全部通过。
 
 两个检查的 `used_turn=7`、`min_compact_hops=2`，summary 分别要求保留

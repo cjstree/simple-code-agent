@@ -1,3 +1,5 @@
+import hashlib
+import re
 from pathlib import Path
 
 import yaml
@@ -5,8 +7,8 @@ from openai import AsyncOpenAI
 from pydantic import BaseModel, TypeAdapter
 
 from code_agent import settings
-from code_agent.telemetry import AgentTelemetry
 from code_agent.prompt import _SYS_MEMORY_SELECTOR
+from code_agent.telemetry import AgentTelemetry
 
 
 class ExtractedMemory(BaseModel):
@@ -93,6 +95,9 @@ class Memory :
             prompt = (
                 "Extract user preferences, constraints, or project facts.\n"
                 "Return JSON array: [{name, type, description, body}].\n"
+                "Use a short name made only of lowercase ASCII letters, digits, "
+                "and hyphens (for example, project-config). "
+                "Do not include slashes, dots, a file extension, or path segments.\n"
                 "If nothing new or already covered, return [].\n\n"
                 f"Existing memories:\n{catalog}\n\nDialogue:\n{dialogue[:4000]}"
             )
@@ -133,7 +138,12 @@ class Memory :
     # write memory content into file.
     def write_memory_file(self,name:str, mem_type:str, description:str, body:str):
         self.path.mkdir(parents=True, exist_ok=True)
-        slug = name.lower().replace(" ", "-")
+        slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+        if not slug:
+            slug = f"memory-{hashlib.sha256(name.encode('utf-8')).hexdigest()[:12]}"
+        elif len(slug) > 100:
+            digest = hashlib.sha256(name.encode("utf-8")).hexdigest()[:12]
+            slug = f"{slug[:87].rstrip('-')}-{digest}"
         filepath = self.path / f"{slug}.md"
         filepath.write_text(
             f"---\nname: {name}\ndescription: {description}\ntype: {mem_type}\n---\n\n{body}\n"
