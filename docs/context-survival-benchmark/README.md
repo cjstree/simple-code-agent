@@ -47,8 +47,14 @@ tool call/result 配对、持久化文件内容完整等底层 compact 不变量
 
 ## 当前可运行样例
 
-`evals/context_survival.jsonl` 目前包含一个 `constraint_rollback_compatibility` 原子样例。
-它使用独立的 rollback fixture，不改变现有 file-edit 样例。第一轮声明 `C-11`（service
+`evals/context_survival.jsonl` 目前包含三个独立原子样例：
+[`constraint_rollback_compatibility`](constraint-rollback-compatibility-case.md)、
+[`decision_release_channel_update`](decision-release-channel-update-case.md) 和
+[`entity_route_alias_binding`](entity-route-alias-binding-case.md)。后两例各为七轮对话，
+分别检查后续决定覆盖旧决定，以及相似实体在 alias 引用下保持正确绑定；其真实 eval
+和 compact 激活尚未验证。
+
+constraint 样例使用独立的 rollback fixture，不改变现有 file-edit 样例。第一轮声明 `C-11`（service
 签名与必填参数）和 `C-12`（旧行可读、保存时保留其他字段），第二轮声明 `C-13`（重复
 rollback 保留第一次的 reason，且只记录一次审计事件）。随后几轮调查 API、存储和测试，
 并分析一份看似省事、却会违反这些约束的候选方案。之后继续检查状态转换、存储行映射、
@@ -77,6 +83,10 @@ reason。每项 check 分别绑定能捕获对应错误的可见或隐藏 pytest
 | compact 激活 | 0.25 | 引入与使用 turn 之间达到 `min_compact_hops` |
 | summary 留存 | 0.25 | 已激活，且窗口内**每次** `session.compact_history` 的 summary 都包含指定标记 |
 | 行为测试 | 0.50 | 每个 check 内的 `behavior_tests` selector 单独运行、等权分配；当前 C-11/C-13 各有两项，C-12 有三项 |
+
+`behavior_tests` 也可按 `FAIL_TO_PASS` 和 `PASS_TO_PASS` 分组。两组均逐 selector
+运行、共同等权分配行为测试的 0.50 分，并在 `behavior.groups` 中分别报告结果；
+`strict_pass` 要求两组全部通过。旧样例的 selector 列表格式和评分保持不变。
 
 `strict_pass` 仅在激活、留存和全部行为测试都通过时为 true，与混合分分开记录。
 例如，某项 check 只有一次 compact 且行为测试全过，得 0.50、`strict_pass=false`；

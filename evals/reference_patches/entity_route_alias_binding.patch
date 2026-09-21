@@ -1,0 +1,18 @@
+diff --git a/route_catalog.py b/route_catalog.py
+--- a/route_catalog.py
++++ b/route_catalog.py
+@@ -1,10 +1,12 @@
+ _BUCKETS = {
+-    "invoice-api-eu": "legacy",
+-    "invoice-api-us": "legacy",
++    "invoice-api-eu": "violet-17",
++    "invoice-api-us": "amber-42",
+     "invoice-api-apac": "archive-04",
+ }
+ _ALIASES = {
+     "line-c": "invoice-api-apac",
++    "line-b": "invoice-api-eu",
++    "line-a": "invoice-api-us",
+ }
+ _KNOWN_ALIAS_NAMES = {"line-a", "line-b"}
+ 

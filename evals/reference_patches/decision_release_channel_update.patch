@@ -1,0 +1,14 @@
+diff --git a/release_policy.py b/release_policy.py
+--- a/release_policy.py
++++ b/release_policy.py
+@@ -8,8 +8,8 @@
+ 
+ 
+ _POLICIES = {
+-    "regular": ReleasePolicy("legacy", ""),
+-    "hotfix": ReleasePolicy("legacy", ""),
++    "regular": ReleasePolicy("staged", "KITE-407"),
++    "hotfix": ReleasePolicy("emergency", "KITE-407"),
+     "preview": ReleasePolicy("pilot", ""),
+ }
+ 

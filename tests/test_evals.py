@@ -707,10 +707,13 @@ def test_reference_patches_satisfy_visible_and_hidden_contracts(tmp_path) -> Non
 
 def test_constraint_sample_declares_isolated_scoring_contract() -> None:
     # Three distinct constraints are scored on an isolated input fixture.
-    samples = list(context_survival_eval().dataset)
-    assert len(samples) == 1
-    sample = samples[0]
-    assert sample.id == "constraint_rollback_compatibility"
+    samples = {sample.id: sample for sample in context_survival_eval().dataset}
+    assert set(samples) == {
+        "constraint_rollback_compatibility",
+        "decision_release_channel_update",
+        "entity_route_alias_binding",
+    }
+    sample = samples["constraint_rollback_compatibility"]
     checks = preservation_checks(sample.metadata)
     assert checks is not None and [check.id for check in checks] == [
         "C-11",
@@ -806,6 +809,135 @@ def test_constraint_fixture_regressions_and_reference_patch(tmp_path) -> None:
     assert locally_passing.returncode == 0, (
         locally_passing.stdout + locally_passing.stderr
     )
+
+
+@pytest.mark.parametrize(
+    ("sample_id", "check_ids", "introduced_turns", "mutation", "regression"),
+    [
+        (
+            "decision_release_channel_update",
+            ["D-21.rev2", "D-22"],
+            [2, 1],
+            (
+                '"hotfix": ReleasePolicy("emergency", "KITE-407")',
+                '"hotfix": ReleasePolicy("pilot", "KITE-407")',
+            ),
+            ".eval_hidden_tests/test_decision_regression.py::test_hotfix_uses_revised_channel",
+        ),
+        (
+            "entity_route_alias_binding",
+            ["E-31", "E-32"],
+            [1, 2],
+            (
+                '"line-b": "invoice-api-eu",\n    "line-a": "invoice-api-us"',
+                '"line-b": "invoice-api-us",\n    "line-a": "invoice-api-eu"',
+            ),
+            ".eval_hidden_tests/test_entity_regression.py::test_eu_binding_exact",
+        ),
+    ],
+)
+def test_atomic_preservation_samples_and_reference_patches(
+    tmp_path, sample_id, check_ids, introduced_turns, mutation, regression
+) -> None:
+    samples = {sample.id: sample for sample in context_survival_eval().dataset}
+    sample = samples[sample_id]
+    checks = preservation_checks(sample.metadata)
+    assert checks is not None
+    assert [check.id for check in checks] == check_ids
+    assert [check.introduced_turn for check in checks] == introduced_turns
+    assert all(check.category == sample.metadata["focus"] for check in checks)
+    assert all(check.used_turn == 7 and check.min_compact_hops == 2 for check in checks)
+    assert len(sample.metadata["turns"]) == 7
+    assert sample.metadata["agent_config"] == {
+        "compact_thresh_hold": 2500,
+        "reserved_token": 700,
+        "max_tool_res": 3,
+    }
+    for check in checks:
+        occurrences = [
+            index
+            for index, turn in enumerate(sample.metadata["turns"], 1)
+            if check.id in turn
+        ]
+        assert occurrences == [check.introduced_turn]
+        assert [name for name, _ in check.behavior_groups] == [
+            "FAIL_TO_PASS",
+            "PASS_TO_PASS",
+        ]
+
+    payload = json.loads(
+        _runner_payload(
+            SimpleNamespace(input_text=sample.input, metadata=sample.metadata)
+        )
+    )
+    assert "context_survival" not in payload
+
+    workspace = tmp_path / sample_id
+    shutil.copytree(Path(sample.files["."]), workspace)
+    project_root = Path(__file__).resolve().parents[1]
+    shutil.copytree(
+        project_root / "evals" / "hidden_tests" / sample_id,
+        workspace / ".eval_hidden_tests",
+    )
+    environment = {
+        **os.environ,
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONPATH": str(workspace),
+    }
+
+    def run_tests(selectors):
+        return subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", *selectors],
+            cwd=workspace,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    for check in checks:
+        for name, selectors in check.behavior_groups:
+            for selector in selectors:
+                baseline = run_tests((selector,))
+                expected = 1 if name == "FAIL_TO_PASS" else 0
+                assert baseline.returncode == expected, (
+                    check.id,
+                    selector,
+                    baseline.stdout,
+                    baseline.stderr,
+                )
+
+    patch = project_root / "evals" / sample.metadata["reference_patch"]
+    applied = subprocess.run(
+        ["git", "apply", str(patch)],
+        cwd=workspace,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+    selectors = tuple(selector for check in checks for selector in check.behavior_tests)
+    reference = run_tests(selectors)
+    assert reference.returncode == 0, reference.stdout + reference.stderr
+
+    source_name = (
+        "release_policy.py" if sample_id.startswith("decision") else "route_catalog.py"
+    )
+    source = workspace / source_name
+    original, wrong = mutation
+    assert original in source.read_text()
+    source.write_text(source.read_text().replace(original, wrong))
+    bad = run_tests((regression,))
+    assert bad.returncode == 1, bad.stdout + bad.stderr
+    pass_to_pass = tuple(
+        selector
+        for check in checks
+        for name, group in check.behavior_groups
+        if name == "PASS_TO_PASS"
+        for selector in group
+    )
+    compatibility = run_tests(pass_to_pass)
+    assert compatibility.returncode == 0, compatibility.stdout + compatibility.stderr
 
 
 @pytest.mark.parametrize(
@@ -940,3 +1072,69 @@ async def test_context_survival_score_requires_trace_and_behavior(monkeypatch) -
         for item in missing_marker.metadata["context_survival"]["checks"]
     ] == [True, False, True]
     assert missing_marker.metadata["context_survival"]["strict_pass"] is False
+
+
+@pytest.mark.asyncio
+async def test_grouped_preservation_tests_are_scored_and_reported(monkeypatch) -> None:
+    samples = {sample.id: sample for sample in context_survival_eval().dataset}
+    sample = samples["decision_release_channel_update"]
+    checks = preservation_checks(sample.metadata)
+    assert checks is not None
+
+    class FakeSandbox:
+        def __init__(self):
+            self.failed_selectors = set()
+            self.commands = []
+
+        async def write_file(self, path, contents):
+            return None
+
+        async def exec(self, command, **kwargs):
+            self.commands.append(command)
+            return SimpleNamespace(
+                success=command[-1] not in self.failed_selectors,
+                stdout="test result",
+                stderr="",
+            )
+
+    async def read_trace(_environment):
+        return SimpleNamespace(
+            compact_history_between=lambda start, end: [
+                SimpleNamespace(output_value="D-21.rev2 D-22 retained")
+                for _ in range(2)
+            ]
+        )
+
+    monkeypatch.setattr(eval_scorer, "read_trace_input", read_trace)
+    state = SimpleNamespace(sample_id=sample.id, metadata=sample.metadata)
+    environment = FakeSandbox()
+    score = await score_tests(state, environment)
+    assert score.value == 1
+    assert score.metadata["context_survival"]["strict_pass"] is True
+    behavior = score.metadata["context_survival"]["checks"][0]["behavior"]
+    assert behavior["tests_total"] == 4
+    assert behavior["groups"]["FAIL_TO_PASS"]["tests_total"] == 2
+    assert behavior["groups"]["PASS_TO_PASS"]["tests_total"] == 2
+    assert all(group["passed"] for group in behavior["groups"].values())
+    assert len(environment.commands) == 7
+
+    environment.failed_selectors.add(checks[0].behavior_groups[1][1][0])
+    failed = await score_tests(state, environment)
+    assert failed.value == pytest.approx(15 / 16)
+    assert failed.metadata["context_survival"]["strict_pass"] is False
+    behavior = failed.metadata["context_survival"]["checks"][0]["behavior"]
+    assert behavior["groups"]["FAIL_TO_PASS"]["passed"] is True
+    assert behavior["groups"]["PASS_TO_PASS"]["passed"] is False
+
+
+def test_grouped_preservation_contract_rejects_missing_or_duplicate_tests() -> None:
+    samples = {sample.id: sample for sample in context_survival_eval().dataset}
+    metadata = json.loads(json.dumps(samples["entity_route_alias_binding"].metadata))
+    groups = metadata["context_survival"]["checks"][0]["behavior_tests"]
+    groups.pop("PASS_TO_PASS")
+    with pytest.raises(ValueError, match="FAIL_TO_PASS and PASS_TO_PASS"):
+        preservation_checks(metadata)
+
+    groups["PASS_TO_PASS"] = groups["FAIL_TO_PASS"][:1]
+    with pytest.raises(ValueError, match="duplicate selectors"):
+        preservation_checks(metadata)

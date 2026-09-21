@@ -45,6 +45,7 @@ class PreservationCheck:
     min_compact_hops: int
     summary_contains: tuple[str, ...]
     behavior_tests: tuple[str, ...]
+    behavior_groups: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
 
 def preservation_checks(
@@ -98,11 +99,37 @@ def preservation_checks(
         ):
             raise ValueError("summary_contains must be a non-empty list of strings")
         selectors = item.get("behavior_tests")
-        if not isinstance(selectors, list) or not selectors:
-            raise ValueError("behavior_tests must be a non-empty list")
-        validated_selectors = tuple(
-            _validated_selector(selector, "behavior_tests") for selector in selectors
-        )
+        behavior_groups: tuple[tuple[str, tuple[str, ...]], ...] = ()
+        if isinstance(selectors, dict):
+            if set(selectors) != set(_TEST_GROUPS):
+                raise ValueError(
+                    "grouped behavior_tests must contain FAIL_TO_PASS and PASS_TO_PASS"
+                )
+            groups = []
+            for name in _TEST_GROUPS:
+                group_selectors = selectors[name]
+                if not isinstance(group_selectors, list) or not group_selectors:
+                    raise ValueError(f"behavior_tests.{name} must be a non-empty list")
+                groups.append(
+                    (
+                        name,
+                        tuple(
+                            _validated_selector(selector, f"behavior_tests.{name}")
+                            for selector in group_selectors
+                        ),
+                    )
+                )
+            behavior_groups = tuple(groups)
+            validated_selectors = tuple(
+                selector for _, group in behavior_groups for selector in group
+            )
+        elif isinstance(selectors, list) and selectors:
+            validated_selectors = tuple(
+                _validated_selector(selector, "behavior_tests")
+                for selector in selectors
+            )
+        else:
+            raise ValueError("behavior_tests must be a non-empty list or test groups")
         if len(validated_selectors) != len(set(validated_selectors)):
             raise ValueError("behavior_tests contains duplicate selectors")
         checks.append(
@@ -114,6 +141,7 @@ def preservation_checks(
                 hops,
                 tuple(markers),
                 validated_selectors,
+                behavior_groups,
             )
         )
     return tuple(checks)
@@ -250,6 +278,25 @@ async def score_tests(state: TaskState, environment: SandboxEnvironment) -> Scor
             tests_passed = sum(test["passed"] for test in tests)
             behavior_passed = tests_passed == len(tests)
             behavior_score = _BEHAVIOR_WEIGHT * tests_passed / len(tests)
+            behavior = {
+                "passed": behavior_passed,
+                "score": behavior_score,
+                "tests_passed": tests_passed,
+                "tests_total": len(tests),
+                "tests": tests,
+            }
+            if check.behavior_groups:
+                test_by_selector = {test["selector"]: test for test in tests}
+                groups = {}
+                for name, selectors in check.behavior_groups:
+                    group_tests = [test_by_selector[selector] for selector in selectors]
+                    groups[name] = {
+                        "passed": all(test["passed"] for test in group_tests),
+                        "tests_passed": sum(test["passed"] for test in group_tests),
+                        "tests_total": len(group_tests),
+                        "tests": group_tests,
+                    }
+                behavior["groups"] = groups
             check_score = (
                 (_ACTIVATION_WEIGHT if activated else 0.0)
                 + (_PRESERVATION_WEIGHT if preserved else 0.0)
@@ -271,13 +318,7 @@ async def score_tests(state: TaskState, environment: SandboxEnvironment) -> Scor
                         "passed": preserved,
                         "score": _PRESERVATION_WEIGHT if preserved else 0.0,
                     },
-                    "behavior": {
-                        "passed": behavior_passed,
-                        "score": behavior_score,
-                        "tests_passed": tests_passed,
-                        "tests_total": len(tests),
-                        "tests": tests,
-                    },
+                    "behavior": behavior,
                 }
             )
             explanations.append(
