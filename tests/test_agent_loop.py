@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import AsyncExitStack
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Self
@@ -17,6 +18,7 @@ from openai.types.chat.chat_completion_message_function_tool_call import Functio
 from openai.types.completion_usage import CompletionUsage
 
 from code_agent.agent import Agent
+from code_agent.memory import Memory
 from code_agent.session import Session
 from code_agent.settings import settings
 from code_agent.telemetry import AgentTelemetry
@@ -230,6 +232,7 @@ async def test_agent_run_can_be_called_without_cli_loop(
 @pytest.mark.asyncio
 async def test_agent_uses_session_for_request_and_response_messages(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     # A started agent stores both sides of a turn in Session-built context.
     monkeypatch.setattr(settings, "llm_api_key", "test-key")
@@ -261,10 +264,10 @@ async def test_agent_uses_session_for_request_and_response_messages(
 
     try:
         await agent.start()
-        agent.memory = SimpleNamespace(
-            extract_memories=extract_memories,
-            select_relevant_memories=select_relevant_memories,
-        )
+        memory = Memory(path=tmp_path, client=object(), telemetry=AgentTelemetry())
+        monkeypatch.setattr(memory, "extract_memories", extract_memories)
+        monkeypatch.setattr(memory, "select_relevant_memories", select_relevant_memories)
+        agent.memory = memory
         monkeypatch.setattr(agent, "_call_api", call_api)
 
         result = await agent.run("hello")
@@ -324,26 +327,196 @@ async def test_agent_run_can_reuse_or_create_session(
         await agent.close()
 
 
-# The Stop hook awaits memory extraction so writes complete before the turn
-# returns to a multi-turn evaluation runner.
 @pytest.mark.asyncio
-async def test_extract_memory_awaits_memory_backend() -> None:
+async def test_agent_close_persists_final_memory_before_returning(tmp_path) -> None:
+    # Closing an Agent writes its final memory before a replacement can start.
     agent = Agent(telemetry=AgentTelemetry())
     agent.session = Session(
         sys_prompt="test system",
         client=object(),  # type: ignore[arg-type]
     )
     agent.session.append_message({"role": "user", "content": "remember this"})
-    extracted_messages: list[list[dict[str, str]]] = []
+    calls = 0
 
-    async def extract_memories(messages: list[dict[str, str]]) -> None:
-        extracted_messages.append(messages)
+    class FakeCompletions:
+        async def create(self, **request: Any) -> Any:
+            nonlocal calls
+            calls += 1
+            assert "remember this" in request["messages"][0]["content"]
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=(
+                    '[{"name":"handoff","type":"project",'
+                    '"description":"Saved fact","body":"remember this"}]'
+                )))]
+            )
 
-    agent.memory = SimpleNamespace(extract_memories=extract_memories)
+    client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    agent.memory = Memory(path=tmp_path, client=client, telemetry=AgentTelemetry())
 
-    await agent.extract_memory()
+    await agent.close()
+    await agent.close()
 
-    assert extracted_messages == [agent.session.build_context()]
+    assert calls == 1
+    assert "remember this" in (tmp_path / "handoff.md").read_text()
+    assert "handoff.md" in (tmp_path / "MEMORY.md").read_text()
+
+
+@pytest.mark.asyncio
+async def test_agent_compact_submits_precompact_memory_without_waiting(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # The turn can compact while extraction retains the original conversation.
+    started = asyncio.Event()
+    release = asyncio.Event()
+    extracted: list[list[dict[str, Any]]] = []
+
+    class FakeCompletions:
+        async def create(self, **request: Any) -> Any:
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="summary"))],
+                usage=CompletionUsage(completion_tokens=2, prompt_tokens=8, total_tokens=10),
+            )
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    agent = Agent(telemetry=AgentTelemetry())
+    agent.session = Session(
+        sys_prompt="system",
+        client=client,  # type: ignore[arg-type]
+        thresh_hold=1,
+        reserved_token=0,
+    )
+    for content in ("old fact", "reply", "more context", "response"):
+        agent.session.append_message({"role": "user", "content": content})
+
+    async def extract_memories(messages: list[dict[str, Any]]) -> None:
+        extracted.append(messages)
+        if len(extracted) == 1:
+            started.set()
+            await release.wait()
+
+    memory = Memory(path=tmp_path, client=object(), telemetry=AgentTelemetry())
+    monkeypatch.setattr(memory, "extract_memories", extract_memories)
+    agent.memory = memory
+
+    await agent.compact()
+    await asyncio.wait_for(started.wait(), timeout=1)
+    assert "old fact" in str(extracted[0])
+    assert "old fact" not in str(agent.session.build_context())
+
+    release.set()
+    await agent.close()
+
+
+@pytest.mark.asyncio
+async def test_agent_close_releases_resources_when_memory_write_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # A memory failure does not prevent the Agent from closing its async resources.
+    agent = Agent(telemetry=AgentTelemetry())
+    agent.session.append_message({"role": "user", "content": "remember this"})
+    released = False
+
+    async def fail_extract(messages: list[dict[str, Any]]) -> None:
+        raise OSError("memory write failed")
+
+    async def release_resource() -> None:
+        nonlocal released
+        released = True
+
+    memory = Memory(path=tmp_path, client=object(), telemetry=AgentTelemetry())
+    monkeypatch.setattr(memory, "extract_memories", fail_extract)
+    agent.memory = memory
+    agent._exit_stack = AsyncExitStack()
+    agent._exit_stack.push_async_callback(release_resource)
+
+    with pytest.raises(OSError, match="memory write failed"):
+        await agent.close()
+
+    assert released is True
+    assert agent._exit_stack is None
+
+
+@pytest.mark.asyncio
+async def test_agent_close_cancellation_stops_memory_and_releases_resources(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    # Cancelling shutdown also stops extraction and closes async resources.
+    agent = Agent(telemetry=AgentTelemetry())
+    agent.session.append_message({"role": "user", "content": "remember this"})
+    started = asyncio.Event()
+    stopped = asyncio.Event()
+    released = asyncio.Event()
+
+    async def slow_extract(messages: list[dict[str, Any]]) -> None:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.set()
+
+    async def release_resource() -> None:
+        released.set()
+
+    memory = Memory(path=tmp_path, client=object(), telemetry=AgentTelemetry())
+    monkeypatch.setattr(memory, "extract_memories", slow_extract)
+    agent.memory = memory
+    agent._exit_stack = AsyncExitStack()
+    agent._exit_stack.push_async_callback(release_resource)
+
+    closing = asyncio.create_task(agent.close())
+    await asyncio.wait_for(started.wait(), timeout=1)
+    closing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await closing
+
+    assert stopped.is_set()
+    assert released.is_set()
+
+
+@pytest.mark.asyncio
+async def test_agent_close_timeout_abandons_remaining_memory_and_releases_resources(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    # A deadline cancels unfinished extraction while shutdown still releases resources.
+    monkeypatch.setattr("code_agent.agent.MEMORY_EXTRACTION_CLOSE_TIMEOUT", 0.01)
+    agent = Agent(telemetry=AgentTelemetry())
+    agent.session.append_message({"role": "user", "content": "remember this"})
+    started = asyncio.Event()
+    stopped = asyncio.Event()
+    released = asyncio.Event()
+    calls = 0
+
+    async def slow_extract(messages: list[dict[str, Any]]) -> None:
+        nonlocal calls
+        calls += 1
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.set()
+
+    async def release_resource() -> None:
+        released.set()
+
+    memory = Memory(path=tmp_path, client=object(), telemetry=AgentTelemetry())
+    monkeypatch.setattr(memory, "extract_memories", slow_extract)
+    agent.memory = memory
+    agent._exit_stack = AsyncExitStack()
+    agent._exit_stack.push_async_callback(release_resource)
+    agent.create_extract_task()
+
+    await agent.close()
+
+    assert started.is_set()
+    assert stopped.is_set()
+    assert released.is_set()
+    assert calls == 1
+    assert "timed out" in capsys.readouterr().out
 
 
 @pytest.mark.asyncio

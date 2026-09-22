@@ -40,6 +40,7 @@ from code_agent.tool_registry import ToolRegistry
 OPENROUTER_KEY = None
 MODEL = settings.llm_model_name
 SKILLS_DIR = None
+MEMORY_EXTRACTION_CLOSE_TIMEOUT = 5
 
 # ANSI colors
 RESET, BOLD, DIM = "\033[0m", "\033[1m", "\033[2m"
@@ -101,7 +102,7 @@ class Agent:
     session: Session
     skill_registry: SkillRegistry
     bgManager: BackgroundManager
-    memory : Memory
+    memory: Memory | None
 
     def __init__(self, telemetry: AgentTelemetry,system_prompt : str | None = None):
         self.telemetry = telemetry
@@ -123,6 +124,8 @@ class Agent:
         )
         self._exit_stack: AsyncExitStack | None = None
         self.mcp_client: MCPClient | None = None
+        self.memory = None
+        self._closed = False
 
     def append_message(
         self,
@@ -159,6 +162,8 @@ class Agent:
     async def compact(self) -> None :
         active_entry_count = len(self.session.entrys) - self.session.check_point
         if active_entry_count > 3:
+            if self.session.need_compact():
+                self.create_extract_task()
             await self.session.compact()
 
     def collect_bg_result(self) -> None:
@@ -180,11 +185,11 @@ class Agent:
                 return False
     def compact_tool_res(self):
         self.session.tool_res_compact()
-    # TODO: add extract frequency control
-    async def extract_memory(self) -> None:
-        if self.memory:
-            messages = self.session.build_context()
-            await self.memory.extract_memories(messages)
+
+    def create_extract_task(self) -> None:
+        if self.memory is None or not self.session.entrys:
+            return
+        self.memory.schedule_extract(self.session.build_context())
 
     async def start(self):
         if not settings.llm_api_key or not settings.llm_model_name:
@@ -213,7 +218,6 @@ class Agent:
         self.registHook(event="PreLLMSubmit",func = self.collect_bg_result)
         self.registHook(event="PreToolUse",func = self.check_tool_permission)
         self.registHook(event="PostToolUse",func = self.compact_tool_res)
-        self.registHook(event="Stop",func = self.extract_memory)
 
         exit_stack = AsyncExitStack()
         try:
@@ -238,11 +242,27 @@ class Agent:
         self.mcp_client = mcp_client
 
     async def close(self) -> None:
-        exit_stack = self._exit_stack
-        self._exit_stack = None
-        self.mcp_client = None
-        if exit_stack is not None:
-            await exit_stack.aclose()
+        try:
+            if self._closed:
+                return
+            self.create_extract_task()
+            self._closed = True
+            if self.memory is not None:
+                completed = await self.memory.close(
+                    timeout=MEMORY_EXTRACTION_CLOSE_TIMEOUT
+                )
+                if not completed:
+                    print(
+                        "Memory extraction timed out after "
+                        f"{MEMORY_EXTRACTION_CLOSE_TIMEOUT} seconds."
+                    )
+        finally:
+            self._closed = True
+            exit_stack = self._exit_stack
+            self._exit_stack = None
+            self.mcp_client = None
+            if exit_stack is not None:
+                await exit_stack.aclose()
 
     # basic io loop, read msg from user input
     async def cli_loop(self):

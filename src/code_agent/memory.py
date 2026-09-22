@@ -1,6 +1,8 @@
+import asyncio
 import hashlib
 import re
 from pathlib import Path
+from typing import Any
 
 import yaml
 from openai import AsyncOpenAI
@@ -64,6 +66,40 @@ class Memory :
         self.path = path
         self.client = client
         self.telemetry = telemetry if telemetry is not None else AgentTelemetry()
+        self._extract_queue: asyncio.Queue[list[dict[str, Any]] | None] = asyncio.Queue()
+        self._extract_task: asyncio.Task[None] | None = None
+        self._closed = False
+
+    def schedule_extract(self, messages: list[dict[str, Any]]) -> None:
+        """Queue a context snapshot for extraction without waiting for the model."""
+        if self._closed:
+            raise RuntimeError("memory extraction is closed")
+        if self._extract_task is None:
+            self._extract_task = asyncio.create_task(self._run_extract_queue())
+        elif self._extract_task.done():
+            self._extract_task.result()
+            raise RuntimeError("memory extraction has stopped")
+        self._extract_queue.put_nowait(messages)
+
+    async def close(self, *, timeout: float) -> bool:
+        """Drain queued extraction, or cancel it when the deadline expires."""
+        if not self._closed:
+            self._closed = True
+            if self._extract_task is not None:
+                self._extract_queue.put_nowait(None)
+        if self._extract_task is None:
+            return True
+        if self._extract_task.cancelled():
+            return False
+        try:
+            await asyncio.wait_for(self._extract_task, timeout=timeout)
+        except TimeoutError:
+            return False
+        return True
+
+    async def _run_extract_queue(self) -> None:
+        while (messages := await self._extract_queue.get()) is not None:
+            await self.extract_memories(messages)
 
     # extract memory from current messages.
     async def extract_memories(self,messages: list[dict[str,str]]) -> None:

@@ -188,9 +188,12 @@ Agent 和消息历史；`agent_config` 可以降低 eval 中的 compact 阈值�
 
 需要验证持久化 memory 跨 Agent 接力时，可以使用
 `metadata.restart_agent_after_turns`。其中的数字是从 1 开始的轮次编号；runner
-会在对应轮次完成（包括 Stop hook）后关闭当前 Agent，再在同一 sandbox 和工作目录
-启动新 Agent。最后一轮不能配置重启。例如下面会让第二轮由新 Agent 执行，而第一轮
-写入的 `./memory` 仍然保留：
+会在对应轮次完成后关闭当前 Agent，再在同一 sandbox 和工作目录启动新 Agent。
+Agent 在历史压缩前向 Memory 提交对话快照，关闭时再提交当前对话。Memory 自行管理
+单个后台任务和队列，按提交顺序提取；Agent 关闭时最多等待 5 秒。超时会取消未完成
+的提取，因此重启后可能缺少尚未写入的 memory。
+最后一轮不能配置重启。例如下面会让第二轮由新 Agent 执行，而第一轮已写入的
+`./memory` 仍然保留：
 
 ```json
 {"metadata":{"turns":["Learn the project convention.","Apply the saved convention."],"restart_agent_after_turns":[1]}}
@@ -208,7 +211,7 @@ memory，并重新应用该样例的 `agent_config`。
 运行时可通过 trace 中重复出现的 `session.compact_history` 人工确认压缩链路。
 
 `release_policy_memory_handoff` 是两个 Agent episode 组成的真实模型场景。第一个 Agent
-只接收源码中不存在的 release 约定并在 Stop hook 中抽取 memory；runner 随后重启
+只接收源码中不存在的 release 约定，并在 Agent 关闭时抽取 memory；runner 随后重启
 Agent。第二个 Agent 必须从磁盘 memory 召回约定、接受当前 hotfix 对其中一个字段的
 覆盖，并在 history compaction 后完成实现。可通过 `memory.extract`、
 `memory.select_relevant` 和 `session.compact_history` trace 人工检查完整链路。
