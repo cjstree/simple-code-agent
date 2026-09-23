@@ -1,5 +1,5 @@
 import asyncio
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Self
@@ -17,7 +17,7 @@ from openai.types.chat.chat_completion_chunk import ChoiceDelta
 from openai.types.chat.chat_completion_message_function_tool_call import Function
 from openai.types.completion_usage import CompletionUsage
 
-from code_agent.agent import Agent
+from code_agent.agent import Agent, AgentLoopResult
 from code_agent.memory import Memory
 from code_agent.session import Session
 from code_agent.settings import settings
@@ -122,6 +122,17 @@ class RecordingTurnSpan:
         self.attributes[key] = value
 
 
+class RecordingTracer:
+    def __init__(self) -> None:
+        self.started: list[tuple[str, dict[str, Any], RecordingTurnSpan]] = []
+
+    @contextmanager
+    def start_as_current_span(self, name: str, *, attributes: dict[str, Any]):
+        span = RecordingTurnSpan()
+        self.started.append((name, attributes, span))
+        yield span
+
+
 @pytest.mark.asyncio
 async def test_agent_trigger_hook_awaits_async_callbacks_in_order() -> None:
     agent = Agent(telemetry=AgentTelemetry())
@@ -207,10 +218,14 @@ async def test_agent_run_can_be_called_without_cli_loop(
         finish_reason="stop",
     )
 
-    async def fake_agent_loop() -> ChatCompletion:
+    async def fake_agent_loop() -> AgentLoopResult:
         nonlocal loop_calls
         loop_calls += 1
-        return completion
+        return AgentLoopResult(
+            completion=completion,
+            stop_reason="stop",
+            tool_rounds=0,
+        )
 
     try:
         await agent.start()
@@ -309,8 +324,12 @@ async def test_agent_run_can_reuse_or_create_session(
         finish_reason="stop",
     )
 
-    async def fake_agent_loop() -> ChatCompletion:
-        return completion
+    async def fake_agent_loop() -> AgentLoopResult:
+        return AgentLoopResult(
+            completion=completion,
+            stop_reason="stop",
+            tool_rounds=0,
+        )
 
     try:
         await agent.start()
@@ -707,7 +726,8 @@ async def test_streaming_prints_raw_text_once_and_stores_complete_message(
     agent.session.append_message({"role": "user", "content": "hello"})
     agent.max_tool_round = 1
 
-    completion = await agent._agent_loop(stream=True)
+    loop_result = await agent._agent_loop(stream=True)
+    completion = loop_result.completion
 
     output = capsys.readouterr().out
     assert output.count("**bold**") == 1
@@ -816,8 +836,11 @@ async def test_agent_completes_one_tool_call_cycle() -> None:
 
     agent._call_api = call_api  # type: ignore[method-assign]
 
-    await agent._agent_loop()
+    loop_result = await agent._agent_loop()
 
+    assert loop_result.stop_reason == "stop"
+    assert loop_result.tool_rounds == 1
+    assert loop_result.completion.choices[0].message.content == "finished"
     assert registry.calls == [("echo", {"value": 2})]
     messages = agent.session.build_context()
     assert [message["role"] for message in messages] == [
@@ -875,7 +898,8 @@ async def test_agent_records_invalid_tool_arguments_before_continuing() -> None:
 
     agent._call_api = call_api  # type: ignore[method-assign]
 
-    completion = await agent._agent_loop()
+    loop_result = await agent._agent_loop()
+    completion = loop_result.completion
 
     assert completion.choices[0].message.content == "recovered"
     assert registry.calls == []
@@ -937,7 +961,8 @@ async def test_agent_records_tool_failure_before_continuing() -> None:
 
     agent._call_api = call_api  # type: ignore[method-assign]
 
-    completion = await agent._agent_loop()
+    loop_result = await agent._agent_loop()
+    completion = loop_result.completion
 
     assert completion.choices[0].message.content == "recovered"
     assert registry.calls == [("echo", {"value": 2})]
@@ -1066,7 +1091,8 @@ async def test_agent_records_denied_sensitive_tool_before_continuing() -> None:
     agent.registHook("PreToolUse", agent.check_tool_permission)
     agent._call_api = call_api  # type: ignore[method-assign]
 
-    completion = await agent._agent_loop()
+    loop_result = await agent._agent_loop()
+    completion = loop_result.completion
 
     assert completion.choices[0].message.content == "not written"
     assert registry.calls == [("write", {"path": "notes.txt"})]
@@ -1114,9 +1140,11 @@ async def test_agent_stops_after_maximum_tool_rounds_with_result_recorded(
     agent._call_api = call_api  # type: ignore[method-assign]
     agent.registHook("Stop", observe_stop)
 
-    completion = await agent._agent_loop()
+    loop_result = await agent._agent_loop()
 
-    assert completion is response
+    assert loop_result.completion is response
+    assert loop_result.stop_reason == "max_tool_rounds"
+    assert loop_result.tool_rounds == 1
     assert request_count == 1
     assert registry.calls == [("echo", {"value": 2})]
     assert stop_contexts[0][-1] == {
@@ -1125,6 +1153,52 @@ async def test_agent_stops_after_maximum_tool_rounds_with_result_recorded(
         "content": "result: 2",
     }
     assert "Maximum tool-call rounds reached." in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_agent_turn_trace_records_maximum_tool_round_stop() -> None:
+    # A capped loop records its agent reason separately from the provider reason.
+    tool_call = ChatCompletionMessageFunctionToolCall(
+        id="call-limit",
+        type="function",
+        function=Function(name="echo", arguments='{"value": 2}'),
+    )
+    response = chat_completion(
+        ChatCompletionMessage(role="assistant", content=None, tool_calls=[tool_call]),
+        finish_reason="tool_calls",
+    )
+    tracer = RecordingTracer()
+    agent = Agent(telemetry=AgentTelemetry(tracer=tracer))
+    agent.tool_registry = FakeRegistry()  # type: ignore[assignment]
+    agent.session = Session(
+        sys_prompt="test system",
+        client=object(),  # type: ignore[arg-type]
+    )
+    agent.max_tool_round = 1
+
+    async def call_api(messages: list[dict[str, Any]]) -> ChatCompletion:
+        return response
+
+    agent._call_api = call_api  # type: ignore[method-assign]
+
+    await agent.run("keep using tools")
+
+    name, _, turn_span = tracer.started[0]
+    assert name == "agent.turn"
+    assert {
+        key: turn_span.attributes[key]
+        for key in (
+            "agent.stop_reason",
+            "agent.tool_rounds",
+            "agent.max_tool_rounds",
+            "llm.finish_reason",
+        )
+    } == {
+        "agent.stop_reason": "max_tool_rounds",
+        "agent.tool_rounds": 1,
+        "agent.max_tool_rounds": 1,
+        "llm.finish_reason": "tool_calls",
+    }
 
 
 @pytest.mark.asyncio
@@ -1199,7 +1273,7 @@ async def test_agent_preserves_explicit_system_prompt_without_memory_lookup() ->
 def test_record_turn_completion_uses_provider_finish_reason(
     finish_reason: str,
 ) -> None:
-    # Turn output and stop reason come directly from the final completion choice.
+    # A normally completed loop keeps the provider reason as its agent reason.
     agent = Agent(telemetry=AgentTelemetry())
     span = RecordingTurnSpan()
     completion = chat_completion(
@@ -1207,10 +1281,23 @@ def test_record_turn_completion_uses_provider_finish_reason(
         finish_reason=finish_reason,
     )
 
-    agent._record_turn_completion(span, completion)
+    agent.max_tool_round = 5
+    agent._record_turn_completion(
+        span,
+        AgentLoopResult(
+            completion=completion,
+            stop_reason=finish_reason,
+            tool_rounds=0,
+        ),
+    )
 
     assert span.output == "final answer"
-    assert span.attributes == {"agent.stop_reason": finish_reason}
+    assert span.attributes == {
+        "agent.stop_reason": finish_reason,
+        "agent.tool_rounds": 0,
+        "agent.max_tool_rounds": 5,
+        "llm.finish_reason": finish_reason,
+    }
 
 
 def test_record_turn_completion_uses_tool_call_message_as_output() -> None:
@@ -1227,10 +1314,23 @@ def test_record_turn_completion_uses_tool_call_message_as_output() -> None:
         finish_reason="tool_calls",
     )
 
-    agent._record_turn_completion(span, completion)
+    agent.max_tool_round = 1
+    agent._record_turn_completion(
+        span,
+        AgentLoopResult(
+            completion=completion,
+            stop_reason="max_tool_rounds",
+            tool_rounds=1,
+        ),
+    )
 
     assert span.output["tool_calls"][0]["id"] == "call-1"
-    assert span.attributes == {"agent.stop_reason": "tool_calls"}
+    assert span.attributes == {
+        "agent.stop_reason": "max_tool_rounds",
+        "agent.tool_rounds": 1,
+        "agent.max_tool_rounds": 1,
+        "llm.finish_reason": "tool_calls",
+    }
 
 
 @pytest.mark.asyncio

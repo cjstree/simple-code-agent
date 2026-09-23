@@ -49,6 +49,12 @@ trace ID. Writes are synchronous, so line order follows span completion rather
 than span start time; consumers should use timestamps and parent span IDs when
 reconstructing execution order.
 
+Each completed `agent.turn` span records `agent.stop_reason`,
+`agent.tool_rounds`, `agent.max_tool_rounds`, and `llm.finish_reason`. When the
+Agent stops because it has exhausted the configured tool-call rounds,
+`agent.stop_reason` is `max_tool_rounds` while `llm.finish_reason` preserves the
+provider's final value, normally `tool_calls`.
+
 ## Validation
 
 ```bash

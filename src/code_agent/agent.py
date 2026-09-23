@@ -6,6 +6,7 @@ import os
 import re
 import uuid
 from contextlib import AsyncExitStack
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -89,6 +90,14 @@ def rsp2msg(resp):
             else {}
         ),
     }
+
+
+@dataclass(frozen=True)
+class AgentLoopResult:
+    completion: ChatCompletion
+    stop_reason: str
+    tool_rounds: int
+
 
 class Agent:
     "an agent implemention. using cli command to intereact. can use tools."
@@ -298,8 +307,8 @@ class Agent:
                 ) as turn_span:
                     self.append_message({"role": "user", "content": user_input})
                     await self.triggerHook("UsrPromptSubmit")
-                    completion = await self._agent_loop(stream=True)
-                    self._record_turn_completion(turn_span, completion)
+                    loop_result = await self._agent_loop(stream=True)
+                    self._record_turn_completion(turn_span, loop_result)
 
         except (EOFError, KeyboardInterrupt):
             print(f"\n{DIM}Goodbye!{RESET}")
@@ -321,28 +330,31 @@ class Agent:
             await self.triggerHook("UsrPromptSubmit")
             # TODO:simplify
             if stream:
-                completion = await self._agent_loop(stream=True)
+                loop_result = await self._agent_loop(stream=True)
             else:
-                completion = await self._agent_loop()
-            self._record_turn_completion(turn_span, completion)
-            return completion.choices[0].message.content
+                loop_result = await self._agent_loop()
+            self._record_turn_completion(turn_span, loop_result)
+            return loop_result.completion.choices[0].message.content
 
     def _record_turn_completion(
-        self, turn_span: Any, completion: ChatCompletion | None
+        self, turn_span: Any, loop_result: AgentLoopResult | None
     ) -> None:
-        if completion is None or not completion.choices:
+        if loop_result is None or not loop_result.completion.choices:
             return
-        choice = completion.choices[0]
+        choice = loop_result.completion.choices[0]
         output = (
             choice.message.content
             if choice.message.content is not None
             else rsp2msg(choice.message)
         )
         turn_span.set_output(output)
-        turn_span.set_attribute("agent.stop_reason", choice.finish_reason)
+        turn_span.set_attribute("agent.stop_reason", loop_result.stop_reason)
+        turn_span.set_attribute("agent.tool_rounds", loop_result.tool_rounds)
+        turn_span.set_attribute("agent.max_tool_rounds", self.max_tool_round)
+        turn_span.set_attribute("llm.finish_reason", choice.finish_reason)
 
     # run agent loop.(Span)
-    async def _agent_loop(self, *, stream: bool = False) -> ChatCompletion:
+    async def _agent_loop(self, *, stream: bool = False) -> AgentLoopResult:
         cur_round = 0
         while cur_round < self.max_tool_round:
             await self.triggerHook("PreLLMSubmit")
@@ -375,10 +387,10 @@ class Agent:
                             f"\n{GREEN}⏺ {tool_name.capitalize()}{RESET}"
                             f"({DIM}{argument_text}{RESET})"
                         )
-                        
+
                         ret = await self.triggerHook("PreToolUse",tool_name = tool_name)
                         approved = ret is None
-                        
+
                         # run the tool
                         res = await self.tool_registry.run_tool(
                             tool_name=tool_name,
@@ -411,10 +423,15 @@ class Agent:
         # stop because achieve max tool call round
         if cur_round == self.max_tool_round:
             print("Maximum tool-call rounds reached.")
-        else :
-            pass
+            stop_reason = "max_tool_rounds"
+        else:
             # stop because not more tool calls
-        return completion
+            stop_reason = completion.choices[0].finish_reason
+        return AgentLoopResult(
+            completion=completion,
+            stop_reason=stop_reason,
+            tool_rounds=cur_round,
+        )
 
     async def _ask_permission(self, tool_name: str) -> bool:
         decision = await ainput(
