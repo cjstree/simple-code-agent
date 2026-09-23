@@ -65,6 +65,37 @@ class FakeChatCompletionStream:
             yield chunk
 
 
+class NoNetworkCompletions:
+    """Serve Memory requests locally and reject unmocked Agent model calls."""
+
+    def __init__(self) -> None:
+        self.memory_requests: list[dict[str, Any]] = []
+
+    async def create(self, **request: Any) -> Any:
+        if "tools" in request:
+            raise AssertionError("Agent unit test attempted an unmocked model call")
+        self.memory_requests.append(request)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="[]"))]
+        )
+
+
+class NoNetworkClient:
+    """Minimal AsyncOpenAI replacement shared by Agent and its default Memory."""
+
+    def __init__(self) -> None:
+        self.completions = NoNetworkCompletions()
+        self.chat = SimpleNamespace(completions=self.completions)
+
+
+@pytest.fixture
+def fake_agent_client(monkeypatch: pytest.MonkeyPatch) -> NoNetworkClient:
+    """Inject a client that makes network access impossible for Agent.start tests."""
+    client = NoNetworkClient()
+    monkeypatch.setattr("code_agent.agent.AsyncOpenAI", lambda **kwargs: client)
+    return client
+
+
 def stream_chunk(
     *,
     delta: dict[str, Any] | None = None,
@@ -181,6 +212,7 @@ async def test_agent_trigger_hook_stops_after_first_returned_result() -> None:
 @pytest.mark.asyncio
 async def test_agent_starts_with_local_tools_and_no_mcp(
     monkeypatch: pytest.MonkeyPatch,
+    fake_agent_client: NoNetworkClient,
 ) -> None:
     monkeypatch.setattr(settings, "llm_api_key", "test-key")
     monkeypatch.setattr(settings, "llm_model_name", "test-model")
@@ -190,6 +222,9 @@ async def test_agent_starts_with_local_tools_and_no_mcp(
     try:
         await agent.start()
 
+        assert agent.client is fake_agent_client
+        assert agent.memory is not None
+        assert agent.memory.client is fake_agent_client
         assert set(agent.tool_registry.tools) == {
             "bash",
             "edit",
@@ -207,6 +242,7 @@ async def test_agent_starts_with_local_tools_and_no_mcp(
 @pytest.mark.asyncio
 async def test_agent_run_can_be_called_without_cli_loop(
     monkeypatch: pytest.MonkeyPatch,
+    fake_agent_client: NoNetworkClient,
 ) -> None:
     monkeypatch.setattr(settings, "llm_api_key", "test-key")
     monkeypatch.setattr(settings, "llm_model_name", "test-model")
@@ -248,6 +284,7 @@ async def test_agent_run_can_be_called_without_cli_loop(
 async def test_agent_uses_session_for_request_and_response_messages(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    fake_agent_client: NoNetworkClient,
 ) -> None:
     # A started agent stores both sides of a turn in Session-built context.
     monkeypatch.setattr(settings, "llm_api_key", "test-key")
@@ -314,6 +351,7 @@ async def test_agent_uses_session_for_request_and_response_messages(
 @pytest.mark.asyncio
 async def test_agent_run_can_reuse_or_create_session(
     monkeypatch: pytest.MonkeyPatch,
+    fake_agent_client: NoNetworkClient,
 ) -> None:
     monkeypatch.setattr(settings, "llm_api_key", "test-key")
     monkeypatch.setattr(settings, "llm_model_name", "test-model")
@@ -541,6 +579,7 @@ async def test_agent_close_timeout_abandons_remaining_memory_and_releases_resour
 @pytest.mark.asyncio
 async def test_agent_keeps_mcp_open_until_close(
     monkeypatch: pytest.MonkeyPatch,
+    fake_agent_client: NoNetworkClient,
 ) -> None:
     monkeypatch.setattr(settings, "llm_api_key", "test-key")
     monkeypatch.setattr(settings, "llm_model_name", "test-model")
@@ -584,6 +623,7 @@ async def test_agent_keeps_mcp_open_until_close(
 async def test_agent_releases_mcp_when_startup_does_not_complete(
     monkeypatch: pytest.MonkeyPatch,
     failure_type: type[BaseException],
+    fake_agent_client: NoNetworkClient,
 ) -> None:
     # MCP resources are released when discovery fails or startup is cancelled.
     monkeypatch.setattr(settings, "llm_api_key", "test-key")
@@ -1348,3 +1388,9 @@ async def test_agent_reads_sensitive_tool_decision(
     agent = Agent(telemetry=AgentTelemetry())
 
     assert await agent._ask_permission("write") is approved
+
+def test_agent_memory_path_defaults_to_workspace_memory() -> None:
+    # Non-eval callers retain the production-relative memory directory.
+    agent = Agent(telemetry=AgentTelemetry())
+
+    assert agent.memory_path == Path("memory")

@@ -64,7 +64,8 @@ rollback 保留第一次的 reason，且只记录一次审计事件）。随后�
 可选；保存 reason 时应保留存储行的其他字段，不能直接重建整行；重复请求也不能覆盖首次
 reason。每项 check 分别绑定能捕获对应错误的可见或隐藏 pytest selector。
 
-评分器读取 `.eval_traces/`，要求每项约束从声明到第十轮之间至少经过两次
+评分器读取 solver 写入 `TaskState.store` 的版本化 trace bundle，要求每项约束从声明到
+第十轮之间至少经过两次
 `session.compact_history`，且窗口内每次 summary 都包含对应标记；随后运行声明的行为
 测试。标记只证明摘要提到了约束，语义是否正确由行为测试判断。每项检查记录
 `activated`、`trace_preserved`、`behavior_passed`、`strict_pass` 和实际 compact 次数。

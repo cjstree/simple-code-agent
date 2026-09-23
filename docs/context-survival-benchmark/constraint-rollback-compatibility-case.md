@@ -66,8 +66,10 @@ workspace。在完成 reason 返回与持久化等功能修复后，若再给 se
 3. [Runner](../../src/code_agent_evals/runner.py) 配置 Agent session，并按顺序执行十轮。
    本样例设置 `compact_thresh_hold=4000`、`reserved_token=700`、`max_tool_res=3`。
    `runner_timeout_seconds=720` 只控制 solver 等待 runner 的上限。
-4. Agent 结束后，[scorer](../../src/code_agent_evals/scorer.py) 读取 sandbox 中的
-   `.eval_traces/`，注入隐藏测试，再检查 trace 和最终代码行为。
+4. Agent 结束后，solver 读取 sample 外部临时目录的 `traces/`，写入
+   `TaskState.store` 后清理临时目录；
+   [scorer](../../src/code_agent_evals/scorer.py) 再注入隐藏测试，并检查 store trace 与
+   最终代码行为。
 
 历史 compact 的触发条件是 `context_token + reserved_token >= compact_thresh_hold`，因此
 当前配置约在活跃上下文达到 3300 token 时触发。实际次数取决于模型回复和工具调用，

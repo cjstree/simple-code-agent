@@ -5,9 +5,33 @@ import pytest
 from code_agent_evals.trace import (
     TraceFormatError,
     TraceUnavailableError,
+    parse_trace_bundle,
     parse_trace_jsonl,
-    read_trace_input,
+    read_trace_bundle,
 )
+
+
+def test_trace_bundle_parser_reads_solver_store_value() -> None:
+    # Scoring reconstructs trace evidence from the solver's JSON-serializable store.
+    content = _jsonl(_span("agent.turn", "turn-1", start_second=1, kind="agent"))
+
+    trace = parse_trace_bundle(
+        {
+            "manifest": _manifest(),
+            "files": {"trace_log_session-1.jsonl": content},
+        }
+    )
+
+    assert len(trace.session("session-1").turns) == 1
+
+
+@pytest.mark.parametrize("bundle", [None, {}, {"manifest": "x"}])
+def test_trace_bundle_parser_classifies_missing_store_data_as_unavailable(
+    bundle,
+) -> None:
+    # Missing versioned solver state remains an infrastructure input failure.
+    with pytest.raises(TraceUnavailableError, match="stored trace bundle"):
+        parse_trace_bundle(bundle)
 
 
 def _span(
@@ -237,40 +261,25 @@ def test_trace_parser_rejects_unbound_scoring_span() -> None:
         parse_trace_jsonl(_manifest(), {"trace_log_session-1.jsonl": content})
 
 
-@pytest.mark.asyncio
-async def test_trace_reader_loads_manifest_references_from_fixed_directory() -> None:
-    # The sandbox adapter reads only the fixed manifest and its declared trace file.
+def test_trace_reader_loads_manifest_references_from_external_directory(
+    tmp_path,
+) -> None:
+    # The solver reader captures only the external manifest and its declared files.
     content = _jsonl(_span("agent.turn", "turn-1", start_second=1, kind="agent"))
+    (tmp_path / "manifest.jsonl").write_text(_manifest(), encoding="utf-8")
+    (tmp_path / "trace_log_session-1.jsonl").write_text(content, encoding="utf-8")
 
-    class FakeSandbox:
-        def __init__(self) -> None:
-            self.paths: list[str] = []
-
-        async def read_file(self, path: str) -> str:
-            self.paths.append(path)
-            if path == ".eval_traces/manifest.jsonl":
-                return _manifest()
-            if path == ".eval_traces/trace_log_session-1.jsonl":
-                return content
-            raise FileNotFoundError(path)
-
-    environment = FakeSandbox()
-
-    trace = await read_trace_input(environment)
+    bundle = read_trace_bundle(tmp_path)
+    trace = parse_trace_bundle(bundle)
 
     assert len(trace.session("session-1").turns) == 1
-    assert environment.paths == [
-        ".eval_traces/manifest.jsonl",
-        ".eval_traces/trace_log_session-1.jsonl",
-    ]
+    assert bundle == {
+        "manifest": _manifest(),
+        "files": {"trace_log_session-1.jsonl": content},
+    }
 
 
-@pytest.mark.asyncio
-async def test_trace_reader_classifies_missing_manifest_as_unavailable() -> None:
-    # A sandbox without exported trace data is distinct from an ordinary score zero.
-    class EmptySandbox:
-        async def read_file(self, path: str) -> str:
-            raise FileNotFoundError(path)
-
+def test_trace_reader_classifies_missing_manifest_as_unavailable(tmp_path) -> None:
+    # A runtime root without exported trace data is an infrastructure failure.
     with pytest.raises(TraceUnavailableError, match="manifest is unavailable"):
-        await read_trace_input(EmptySandbox())
+        read_trace_bundle(tmp_path)

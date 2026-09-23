@@ -6,13 +6,13 @@ import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from types import MappingProxyType
-from typing import Any, Protocol
+from typing import Any
 
-TRACE_DIRECTORY = PurePosixPath(".eval_traces")
 TRACE_MANIFEST = "manifest.jsonl"
 TRACE_SCHEMA_VERSION = 1
+TRACE_STORE_KEY = "code_agent_eval.trace.v1"
 _SCORING_SPAN_NAMES = {"session.compact", "session.compact_history"}
 
 
@@ -26,12 +26,6 @@ class TraceUnavailableError(TraceInputError):
 
 class TraceFormatError(TraceInputError):
     """Trace JSONL exists but does not satisfy the eval input contract."""
-
-
-class TraceSandbox(Protocol):
-    """The subset of Inspect's sandbox API needed to load trace input."""
-
-    async def read_file(self, path: str) -> str: ...
 
 
 @dataclass(frozen=True)
@@ -391,15 +385,28 @@ def parse_trace_jsonl(
     return EvaluationTrace(sessions=MappingProxyType(sessions))
 
 
-async def read_trace_input(
-    environment: TraceSandbox,
-    directory: PurePosixPath = TRACE_DIRECTORY,
-) -> EvaluationTrace:
-    """Read and parse eval traces from a sample sandbox before it is cleaned up."""
-    manifest_path = (directory / TRACE_MANIFEST).as_posix()
+def parse_trace_bundle(value: Any) -> EvaluationTrace:
+    """Validate and parse the JSON-serializable trace bundle stored by the solver."""
+    if not isinstance(value, dict):
+        raise TraceUnavailableError("stored trace bundle is missing or invalid")
+    manifest = value.get("manifest")
+    files = value.get("files")
+    if not isinstance(manifest, str) or not isinstance(files, dict):
+        raise TraceUnavailableError("stored trace bundle is missing manifest or files")
+    if any(
+        not isinstance(name, str) or not isinstance(text, str)
+        for name, text in files.items()
+    ):
+        raise TraceFormatError("stored trace bundle files must map names to text")
+    return parse_trace_jsonl(manifest, files)
+
+
+def read_trace_bundle(trace_directory: Path) -> dict[str, Any]:
+    """Read and validate all manifest-declared files from an external trace root."""
+    manifest_path = trace_directory / TRACE_MANIFEST
     try:
-        manifest = await environment.read_file(manifest_path)
-    except Exception as error:
+        manifest = manifest_path.read_text(encoding="utf-8")
+    except OSError as error:
         raise TraceUnavailableError(
             f"trace manifest is unavailable: {manifest_path}"
         ) from error
@@ -410,11 +417,12 @@ async def read_trace_input(
         filename = _manifest_filename(
             record.get("file"), f"{TRACE_MANIFEST}:{line_number}"
         )
-        path = (directory / filename).as_posix()
         try:
-            files[filename] = await environment.read_file(path)
-        except Exception as error:
+            files[filename] = (trace_directory / filename).read_text(encoding="utf-8")
+        except OSError as error:
             raise TraceUnavailableError(
                 f"manifest references unavailable trace file {filename!r}"
             ) from error
-    return parse_trace_jsonl(manifest, files)
+    bundle = {"manifest": manifest, "files": files}
+    parse_trace_bundle(bundle)
+    return bundle

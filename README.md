@@ -108,9 +108,14 @@ PHOENIX_COLLECTOR_ENDPOINT=http://localhost:6006/v1/traces
 PHOENIX_PROJECT_NAME=code-agent-eval
 ```
 
-也可以通过 `TRACE_LOG_DIR` 在 eval sandbox 中导出相同 span 的本地 JSONL；它不要求
-启用或运行 Phoenix。当前 scorer 不消费这些文件，样例结束后 sandbox 仍会按 Inspect
-生命周期清理。
+Eval runner 不使用 `TRACE_LOG_DIR` 选择落盘位置。solver 会为每个 sample 创建独立的
+系统临时目录，runner 把 JSONL 写入其中的 `traces/`；Agent 工作目录内不会生成
+`.eval_traces/`。runner 完成并 flush telemetry 后，solver 将 manifest 与其引用的完整
+trace 文件写入 `TaskState.store` 的 `code_agent_eval.trace.v1`，随即删除临时目录。
+声明 trace 评分契约的 scorer 只读取 store bundle，不接触临时绝对路径。
+
+这项 eval 专用覆盖不改变 CLI 的常规行为；非 eval 调用仍可通过 `TRACE_LOG_DIR` 配置
+本地 JSONL 位置。
 
 Inspect 仍负责创建样例工作目录、执行 solver 和运行 pytest scorer，但模型调用、
 token 配置和 Phoenix telemetry 均由 Agent 自己负责。
@@ -197,17 +202,19 @@ Agent 和消息历史；`agent_config` 可以降低 eval 中的 compact 阈值�
 会在对应轮次完成后关闭当前 Agent，再在同一 sandbox 和工作目录启动新 Agent。
 Agent 在历史压缩前向 Memory 提交对话快照，关闭时再提交当前对话。Memory 自行管理
 单个后台任务和队列，按提交顺序提取；Agent 关闭时最多等待 5 秒。超时会取消未完成
-的提取，因此重启后可能缺少尚未写入的 memory。
+的提取，因此重启后可能缺少尚未写入的 memory。Eval 启动第一个 Agent 前会把 fixture
+的 `memory/` 移出工作目录，放入该 sample 临时根目录的 `memory/`；工作目录不保留副本。
 最后一轮不能配置重启。例如下面会让第二轮由新 Agent 执行，而第一轮已写入的
-`./memory` 仍然保留：
+外部 memory 仍然保留：
 
 ```json
 {"metadata":{"turns":["Learn the project convention.","Apply the saved convention."],"restart_agent_after_turns":[1]}}
 ```
 
 `restart_agent_after_turns` 只改变 eval runner 的实例生命周期，不修改 Agent 的生产
-行为。新 Agent 不继承旧 Session 消息，但会重新扫描同一工作目录中的 skills 和
-memory，并重新应用该样例的 `agent_config`。
+行为。新 Agent 不继承旧 Session 消息，但会重新扫描同一工作目录中的 skills，复用
+同一个 eval 外部 memory 路径，并重新应用该样例的 `agent_config`。非 eval Agent 未显式
+传入路径时仍使用 `./memory`。
 
 ### 复合能力样例
 

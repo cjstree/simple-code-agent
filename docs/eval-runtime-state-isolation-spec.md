@@ -2,8 +2,8 @@
 
 ## 状态
 
-本文定义 eval 中 trace 与 memory 的最终落盘和传递方案。当前仅记录设计；实现该方案时，
-应同步更新测试、README 和现有 trace 输入契约。
+本文定义 eval 中 trace 与 memory 的最终落盘和传递方案。该方案已实现；后续修改应同步
+更新测试、README 和 trace 输入契约。
 
 ## 背景
 
@@ -198,4 +198,3 @@ runner 诊断或下一轮 Agent 上下文。
 - `docs/context-survival-benchmark/trace-input-contract.md` 中 `.eval_traces/` 的生成位置
   与 scorer 读取方式；
 - eval runner、solver、trace reader 和 memory restart 相关测试说明。
-

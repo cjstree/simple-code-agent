@@ -113,7 +113,12 @@ class Agent:
     bgManager: BackgroundManager
     memory: Memory | None
 
-    def __init__(self, telemetry: AgentTelemetry,system_prompt : str | None = None):
+    def __init__(
+        self,
+        telemetry: AgentTelemetry,
+        system_prompt: str | None = None,
+        memory_path: Path = Path("./memory"),
+    ):
         self.telemetry = telemetry
         self.session_id = str(uuid.uuid4())
         self.hooks = {
@@ -134,6 +139,7 @@ class Agent:
         self._exit_stack: AsyncExitStack | None = None
         self.mcp_client: MCPClient | None = None
         self.memory = None
+        self.memory_path = memory_path
         self._closed = False
 
     def append_message(
@@ -214,7 +220,7 @@ class Agent:
         self.context_manager = ContextManager(self.client, telemetry=self.telemetry)
         self.session = Session(sys_prompt=self.system_prompt,client=self.client,telemetry=self.telemetry)
         self.memory = Memory(
-            path=Path("./memory"),
+            path=self.memory_path,
             client=self.client,
             telemetry=self.telemetry,
         )

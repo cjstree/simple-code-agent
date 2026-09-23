@@ -11,7 +11,12 @@ from inspect_ai.scorer import Score, Scorer, Target, accuracy, scorer
 from inspect_ai.solver import TaskState
 from inspect_ai.util import SandboxEnvironment, sandbox
 
-from code_agent_evals.trace import EvaluationTrace, TraceFormatError, read_trace_input
+from code_agent_evals.trace import (
+    TRACE_STORE_KEY,
+    EvaluationTrace,
+    TraceFormatError,
+    parse_trace_bundle,
+)
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _HIDDEN_TESTS_ROOT = _PROJECT_ROOT / "evals" / "hidden_tests"
@@ -257,7 +262,7 @@ async def score_tests(state: TaskState, environment: SandboxEnvironment) -> Scor
     """Score legacy pytest suites or an explicit mini-SWE test contract."""
     checks = preservation_checks(state.metadata)
     if checks is not None:
-        trace = await read_trace_input(environment)
+        trace = parse_trace_bundle(state.store.get(TRACE_STORE_KEY))
         if any(
             selector.startswith(f"{_HIDDEN_TESTS_DESTINATION}/")
             for check in checks

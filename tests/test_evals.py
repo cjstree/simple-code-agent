@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import shutil
@@ -20,7 +21,57 @@ from code_agent_evals.scorer import (
 )
 from code_agent_evals.solver import _runner_payload
 from code_agent_evals.tasks import basic_agent_eval, context_survival_eval
-from code_agent_evals.trace import parse_trace_jsonl
+from code_agent_evals.trace import TRACE_STORE_KEY, TraceInputError, parse_trace_jsonl
+
+
+class FakeStore:
+    def __init__(self, values=None) -> None:
+        self.values = dict(values or {})
+
+    def get(self, key, default=None):
+        return self.values.get(key, default)
+
+    def set(self, key, value) -> None:
+        self.values[key] = value
+
+
+def _payload(**values) -> str:
+    return json.dumps({"eval_runtime_root": "/tmp/eval-runtime", **values})
+
+
+def _write_valid_trace(runtime_root: Path) -> dict[str, str]:
+    traces = runtime_root / "traces"
+    traces.mkdir()
+    manifest = json.dumps(
+        {
+            "schema_version": 1,
+            "session_id": "session-1",
+            "file": "trace_log_session-1.jsonl",
+        }
+    )
+    content = json.dumps(
+        {
+            "schema_version": 1,
+            "name": "agent.turn",
+            "context": {"trace_id": "trace-1", "span_id": "turn-1"},
+            "parent_id": None,
+            "start_time": "2026-09-23T00:00:00Z",
+            "end_time": "2026-09-23T00:00:01Z",
+            "attributes": {"session.id": "session-1"},
+        }
+    )
+    (traces / "manifest.jsonl").write_text(manifest, encoding="utf-8")
+    (traces / "trace_log_session-1.jsonl").write_text(content, encoding="utf-8")
+    return {"manifest": manifest, "files": {"trace_log_session-1.jsonl": content}}
+
+
+def _empty_runtime(tmp_path: Path, monkeypatch) -> Path:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+    monkeypatch.chdir(workspace)
+    return runtime_root
 
 
 def test_basic_agent_eval_uses_isolated_file_fixture() -> None:
@@ -62,12 +113,10 @@ def test_multiturn_eval_payload_is_available_to_runner() -> None:
     samples = {sample.id: sample for sample in task.dataset}
     sample = samples["fix_add_multiturn_compact"]
 
-    turns, config, restart_after_turns = parse_payload(
-        json.dumps(
-            {
-                "turns": sample.metadata["turns"],
-                "agent_config": sample.metadata["agent_config"],
-            }
+    turns, config, restart_after_turns, runtime_root = parse_payload(
+        _payload(
+            turns=sample.metadata["turns"],
+            agent_config=sample.metadata["agent_config"],
         )
     )
 
@@ -75,18 +124,21 @@ def test_multiturn_eval_payload_is_available_to_runner() -> None:
     assert turns[-1] == "Now fix the implementation and run the tests."
     assert config == {"compact_thresh_hold": 500}
     assert restart_after_turns == ()
+    assert runtime_root == Path("/tmp/eval-runtime")
 
 
-# Existing single-prompt callers remain valid while context settings are
+# Runner input must come from the solver while context settings remain
 # restricted to the allowlisted evaluation thresholds.
-def test_runner_accepts_legacy_prompt_and_applies_session_config() -> None:
-    # Legacy prompts still work and eval thresholds configure the Session.
-    assert parse_payload("plain prompt") == (["plain prompt"], {}, ())
-    assert parse_payload('"JSON-shaped prompt"') == (
-        ['"JSON-shaped prompt"'],
-        {},
-        (),
-    )
+def test_runner_requires_solver_owned_runtime_root_and_applies_session_config() -> None:
+    # Direct or relative-path payloads cannot bypass the solver-owned runtime root.
+    with pytest.raises(ValueError, match="JSON object"):
+        parse_payload("plain prompt")
+    with pytest.raises(ValueError, match="absolute path"):
+        parse_payload(json.dumps({"turns": ["prompt"]}))
+    with pytest.raises(ValueError, match="absolute path"):
+        parse_payload(
+            json.dumps({"turns": ["prompt"], "eval_runtime_root": "relative"})
+        )
     session = SimpleNamespace(compact_thresh_hold=128_000)
     agent = SimpleNamespace(session=session)
 
@@ -97,7 +149,7 @@ def test_runner_accepts_legacy_prompt_and_applies_session_config() -> None:
 
 def test_runner_rejects_obsolete_context_manager_config() -> None:
     # Eval config must not silently target the retired context manager.
-    payload = json.dumps({"turns": ["first"], "agent_config": {"context_limit": 500}})
+    payload = _payload(turns=["first"], agent_config={"context_limit": 500})
 
     with pytest.raises(ValueError, match="unsupported agent_config fields"):
         parse_payload(payload)
@@ -112,15 +164,17 @@ def test_solver_serializes_multiturn_runner_payload() -> None:
         metadata={
             "turns": ["first", "second"],
             "agent_config": {"compact_thresh_hold": 600},
+            "eval_runtime_root": "/tmp/dataset-controlled",
             "FAIL_TO_PASS": ["tests/test_hidden_contract.py::test_fix"],
             "PASS_TO_PASS": ["tests/test_hidden_contract.py::test_existing"],
         },
     )
 
-    assert json.loads(_runner_payload(state)) == {
+    assert json.loads(_runner_payload(state, Path("/tmp/owned-runtime"))) == {
         "turns": ["first", "second"],
         "agent_config": {"compact_thresh_hold": 600},
         "restart_agent_after_turns": [],
+        "eval_runtime_root": "/tmp/owned-runtime",
     }
 
 
@@ -133,30 +187,30 @@ async def test_solver_runs_agent_without_bridge_or_llm_overrides(monkeypatch) ->
     class FakeSandbox:
         async def exec(self, command, **kwargs):
             calls.append((command, kwargs))
+            runtime_root = Path(json.loads(kwargs["input"])["eval_runtime_root"])
+            _write_valid_trace(runtime_root)
             return SimpleNamespace(success=True, stdout="final answer", stderr="")
 
     monkeypatch.setattr(eval_solver, "sandbox", lambda: FakeSandbox())
-    state = SimpleNamespace(input_text="fix it", metadata=None, output=None)
+    state = SimpleNamespace(
+        input_text="fix it", metadata=None, output=None, store=FakeStore()
+    )
 
     result = await eval_solver.my_agent_solver()(state, None)
 
     assert result is state
-    assert calls == [
-        (
-            [sys.executable, "-m", "code_agent_evals.runner"],
-            {
-                "input": json.dumps(
-                    {
-                        "turns": ["fix it"],
-                        "agent_config": {},
-                        "restart_agent_after_turns": [],
-                    },
-                    ensure_ascii=False,
-                ),
-                "timeout": 300,
-            },
-        )
-    ]
+    assert calls[0][0] == [sys.executable, "-m", "code_agent_evals.runner"]
+    sent_payload = json.loads(calls[0][1]["input"])
+    runtime_root = Path(sent_payload.pop("eval_runtime_root"))
+    assert sent_payload == {
+        "turns": ["fix it"],
+        "agent_config": {},
+        "restart_agent_after_turns": [],
+    }
+    assert runtime_root.is_absolute()
+    assert not runtime_root.exists()
+    assert calls[0][1]["timeout"] == 300
+    assert state.store.get(TRACE_STORE_KEY)["manifest"]
     assert state.output.completion == "final answer"
 
 
@@ -168,12 +222,17 @@ async def test_solver_uses_sample_timeout_without_forwarding_it(monkeypatch) -> 
     class FakeSandbox:
         async def exec(self, command, **kwargs):
             calls.append(kwargs)
+            runtime_root = Path(json.loads(kwargs["input"])["eval_runtime_root"])
+            _write_valid_trace(runtime_root)
             return SimpleNamespace(success=True, stdout="done", stderr="")
 
     monkeypatch.setattr(eval_solver, "sandbox", lambda: FakeSandbox())
     sample = next(iter(context_survival_eval().dataset))
     state = SimpleNamespace(
-        input_text=sample.input, metadata=sample.metadata, output=None
+        input_text=sample.input,
+        metadata=sample.metadata,
+        output=None,
+        store=FakeStore(),
     )
 
     await eval_solver.my_agent_solver()(state, None)
@@ -188,16 +247,101 @@ async def test_solver_uses_sample_timeout_without_forwarding_it(monkeypatch) -> 
     assert len(calls) == 1
 
 
+@pytest.mark.asyncio
+async def test_solver_uses_unique_runtime_roots_and_cleans_failed_runs(
+    monkeypatch,
+) -> None:
+    # Concurrent samples never share state, and a runner failure removes both roots.
+    roots = []
+
+    class FailingSandbox:
+        async def exec(self, command, **kwargs):
+            roots.append(Path(json.loads(kwargs["input"])["eval_runtime_root"]))
+            await asyncio.sleep(0)
+            return SimpleNamespace(success=False, stdout="", stderr="runner failed")
+
+    monkeypatch.setattr(eval_solver, "sandbox", lambda: FailingSandbox())
+
+    async def invoke():
+        state = SimpleNamespace(
+            input_text="fix it", metadata=None, output=None, store=FakeStore()
+        )
+        with pytest.raises(RuntimeError, match="runner failed"):
+            await eval_solver.my_agent_solver()(state, None)
+
+    await asyncio.gather(invoke(), invoke())
+
+    assert len(set(roots)) == 2
+    assert all(root.is_absolute() and not root.exists() for root in roots)
+
+
+@pytest.mark.asyncio
+async def test_solver_cleans_runtime_root_when_cancelled(monkeypatch) -> None:
+    # Cancellation propagates after the solver removes its per-sample runtime root.
+    roots = []
+
+    class CancelledSandbox:
+        async def exec(self, command, **kwargs):
+            roots.append(Path(json.loads(kwargs["input"])["eval_runtime_root"]))
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(eval_solver, "sandbox", lambda: CancelledSandbox())
+    state = SimpleNamespace(
+        input_text="fix it", metadata=None, output=None, store=FakeStore()
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await eval_solver.my_agent_solver()(state, None)
+
+    assert len(roots) == 1
+    assert not roots[0].exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["missing_trace", "corrupt_trace", "timeout"])
+async def test_solver_cleans_runtime_root_after_infrastructure_failure(
+    monkeypatch, failure: str
+) -> None:
+    # Missing flushed trace data and runner timeouts both preserve cleanup guarantees.
+    roots = []
+
+    class BrokenSandbox:
+        async def exec(self, command, **kwargs):
+            roots.append(Path(json.loads(kwargs["input"])["eval_runtime_root"]))
+            if failure == "timeout":
+                raise TimeoutError("runner timed out")
+            if failure == "corrupt_trace":
+                traces = roots[-1] / "traces"
+                traces.mkdir()
+                (traces / "manifest.jsonl").write_text("not-json", encoding="utf-8")
+            return SimpleNamespace(success=True, stdout="answer", stderr="")
+
+    monkeypatch.setattr(eval_solver, "sandbox", lambda: BrokenSandbox())
+    state = SimpleNamespace(
+        input_text="fix it", metadata=None, output=None, store=FakeStore()
+    )
+
+    with pytest.raises((TimeoutError, TraceInputError)):
+        await eval_solver.my_agent_solver()(state, None)
+
+    assert len(roots) == 1
+    assert not roots[0].exists()
+    assert state.store.get(TRACE_STORE_KEY) is None
+
+
 # The first turn creates the eval session and every later turn reuses it; the
 # final response is returned only after the shared Agent is closed.
 @pytest.mark.asyncio
-async def test_runner_executes_turns_in_one_agent_session(monkeypatch) -> None:
+async def test_runner_executes_turns_in_one_agent_session(
+    monkeypatch, tmp_path: Path
+) -> None:
     # All turns share one Agent Session configured before the first turn.
     agents = []
 
     class FakeAgent:
-        def __init__(self, telemetry) -> None:
+        def __init__(self, telemetry, memory_path) -> None:
             self.telemetry = telemetry
+            self.memory_path = memory_path
             self.session = SimpleNamespace(compact_thresh_hold=128_000)
             self.calls: list[tuple[str, bool]] = []
             self.closed = False
@@ -227,8 +371,11 @@ async def test_runner_executes_turns_in_one_agent_session(monkeypatch) -> None:
         SimpleNamespace(initialize=initialize_telemetry),
     )
 
+    runtime_root = _empty_runtime(tmp_path, monkeypatch)
     result = await runner.run(
-        ["first", "second", "third"], {"compact_thresh_hold": 500}
+        ["first", "second", "third"],
+        {"compact_thresh_hold": 500},
+        runtime_root=runtime_root,
     )
 
     assert result == "answer: third"
@@ -239,19 +386,22 @@ async def test_runner_executes_turns_in_one_agent_session(monkeypatch) -> None:
     ]
     assert agents[0].session.compact_thresh_hold == 500
     assert agents[0].closed is True
-    assert telemetry_settings[0]["trace_log_dir"].as_posix() == ".eval_traces"
+    assert telemetry_settings[0]["trace_log_dir"] == runtime_root / "traces"
+    assert agents[0].memory_path == runtime_root / "memory"
+    assert not (Path.cwd() / ".eval_traces").exists()
 
 
 @pytest.mark.asyncio
 async def test_runner_restarts_agent_between_memory_handoff_episodes(
-    monkeypatch,
+    monkeypatch, tmp_path: Path
 ) -> None:
     # A requested restart closes the old Agent and starts a fresh configured session.
     agents = []
 
     class FakeAgent:
-        def __init__(self, telemetry) -> None:
+        def __init__(self, telemetry, memory_path) -> None:
             self.telemetry = telemetry
+            self.memory_path = memory_path
             self.session = SimpleNamespace(compact_thresh_hold=128_000)
             self.calls: list[tuple[str, bool]] = []
             self.closed = False
@@ -275,10 +425,12 @@ async def test_runner_restarts_agent_between_memory_handoff_episodes(
         SimpleNamespace(initialize=lambda **kwargs: telemetry),
     )
 
+    runtime_root = _empty_runtime(tmp_path, monkeypatch)
     result = await runner.run(
         ["learn convention", "recall convention", "implement"],
         {"compact_thresh_hold": 1_200},
         (1,),
+        runtime_root=runtime_root,
     )
 
     assert result == "answer: implement"
@@ -287,17 +439,77 @@ async def test_runner_restarts_agent_between_memory_handoff_episodes(
         [("recall convention", True), ("implement", False)],
     ]
     assert [agent.session.compact_thresh_hold for agent in agents] == [1_200, 1_200]
+    assert {agent.memory_path for agent in agents} == {runtime_root / "memory"}
     assert all(agent.closed for agent in agents)
+
+
+@pytest.mark.asyncio
+async def test_runner_moves_fixture_memory_before_agent_start(
+    monkeypatch, tmp_path: Path
+) -> None:
+    # The first Agent sees only the external memory root; no workspace copy remains.
+    runtime_root = _empty_runtime(tmp_path, monkeypatch)
+    workspace_memory = Path("memory")
+    workspace_memory.mkdir()
+    (workspace_memory / "MEMORY.md").write_text("fixture index", encoding="utf-8")
+    observed = []
+
+    class FakeAgent:
+        def __init__(self, telemetry, memory_path) -> None:
+            self.memory_path = memory_path
+            self.session = SimpleNamespace()
+
+        async def start(self) -> None:
+            observed.append(
+                (
+                    Path("memory").exists(),
+                    (self.memory_path / "MEMORY.md").read_text(encoding="utf-8"),
+                )
+            )
+
+        async def run(self, turn: str, *, new_session: bool = True) -> str:
+            return "done"
+
+        async def close(self) -> None:
+            return None
+
+    telemetry = SimpleNamespace(shutdown=lambda: None)
+    monkeypatch.setattr(runner, "Agent", FakeAgent)
+    monkeypatch.setattr(
+        runner,
+        "AgentTelemetry",
+        SimpleNamespace(initialize=lambda **kwargs: telemetry),
+    )
+
+    await runner.run(["use memory"], {}, runtime_root=runtime_root)
+
+    assert observed == [(False, "fixture index")]
+    assert not workspace_memory.exists()
+    assert (runtime_root / "memory" / "MEMORY.md").is_file()
+
+
+def test_runner_rejects_workspace_file_and_preexisting_runtime_state(
+    monkeypatch, tmp_path: Path
+) -> None:
+    # Invalid memory sources and occupied destinations fail instead of overwriting.
+    runtime_root = _empty_runtime(tmp_path, monkeypatch)
+    Path("memory").write_text("not a directory", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="not a directory"):
+        runner.prepare_runtime_directories(runtime_root)
+
+    Path("memory").unlink()
+    (runtime_root / "traces").mkdir()
+    with pytest.raises(RuntimeError, match="unexpected state"):
+        runner.prepare_runtime_directories(runtime_root)
 
 
 def test_runner_validates_agent_restart_boundaries() -> None:
     # Restarts may occur once after any turn except the final turn.
-    turns, _, restart_after_turns = parse_payload(
-        json.dumps(
-            {
-                "turns": ["first", "second", "third"],
-                "restart_agent_after_turns": [2, 1],
-            }
+    turns, _, restart_after_turns, _ = parse_payload(
+        _payload(
+            turns=["first", "second", "third"],
+            restart_agent_after_turns=[2, 1],
         )
     )
 
@@ -306,35 +518,26 @@ def test_runner_validates_agent_restart_boundaries() -> None:
 
     with pytest.raises(ValueError, match="non-final turn"):
         parse_payload(
-            json.dumps(
-                {
-                    "turns": ["first", "second"],
-                    "restart_agent_after_turns": [2],
-                }
-            )
+            _payload(turns=["first", "second"], restart_agent_after_turns=[2])
         )
 
     with pytest.raises(ValueError, match="duplicates"):
         parse_payload(
-            json.dumps(
-                {
-                    "turns": ["first", "second"],
-                    "restart_agent_after_turns": [1, 1],
-                }
-            )
+            _payload(turns=["first", "second"], restart_agent_after_turns=[1, 1])
         )
 
 
 @pytest.mark.asyncio
 async def test_runner_cleans_up_when_replacement_agent_cannot_start(
-    monkeypatch,
+    monkeypatch, tmp_path: Path
 ) -> None:
     # A failed episode restart closes both Agent instances and shuts down telemetry.
     agents = []
 
     class FakeAgent:
-        def __init__(self, telemetry) -> None:
+        def __init__(self, telemetry, memory_path) -> None:
             self.telemetry = telemetry
+            self.memory_path = memory_path
             self.session = SimpleNamespace(compact_thresh_hold=128_000)
             self.closed = False
             agents.append(self)
@@ -362,8 +565,9 @@ async def test_runner_cleans_up_when_replacement_agent_cannot_start(
         SimpleNamespace(initialize=lambda **kwargs: telemetry),
     )
 
+    runtime_root = _empty_runtime(tmp_path, monkeypatch)
     with pytest.raises(RuntimeError, match="replacement startup failed"):
-        await runner.run(["learn", "recall"], {}, (1,))
+        await runner.run(["learn", "recall"], {}, (1,), runtime_root=runtime_root)
 
     assert len(agents) == 2
     assert all(agent.closed for agent in agents)
@@ -568,7 +772,8 @@ def test_mixed_capability_samples_document_scenarios_and_runner_behavior() -> No
 
     payload = json.loads(
         _runner_payload(
-            SimpleNamespace(input_text=memory.input, metadata=memory.metadata)
+            SimpleNamespace(input_text=memory.input, metadata=memory.metadata),
+            Path("/tmp/owned-runtime"),
         )
     )
     assert payload["restart_agent_after_turns"] == [1]
@@ -725,7 +930,8 @@ def test_constraint_sample_declares_isolated_scoring_contract() -> None:
     assert [check.introduced_turn for check in checks] == [1, 1, 2]
     payload = json.loads(
         _runner_payload(
-            SimpleNamespace(input_text=sample.input, metadata=sample.metadata)
+            SimpleNamespace(input_text=sample.input, metadata=sample.metadata),
+            Path("/tmp/owned-runtime"),
         )
     )
     assert "context_survival" not in payload
@@ -867,7 +1073,8 @@ def test_atomic_preservation_samples_and_reference_patches(
 
     payload = json.loads(
         _runner_payload(
-            SimpleNamespace(input_text=sample.input, metadata=sample.metadata)
+            SimpleNamespace(input_text=sample.input, metadata=sample.metadata),
+            Path("/tmp/owned-runtime"),
         )
     )
     assert "context_survival" not in payload
@@ -1012,11 +1219,15 @@ async def test_context_survival_score_requires_trace_and_behavior(monkeypatch) -
 
     spans = [SimpleNamespace(output_value="C-11 C-12 C-13 retained") for _ in range(2)]
 
-    async def read_trace(_environment):
+    def parse_bundle(_bundle):
         return SimpleNamespace(compact_history_between=lambda start, end: spans)
 
-    monkeypatch.setattr(eval_scorer, "read_trace_input", read_trace)
-    state = SimpleNamespace(sample_id=sample.id, metadata=metadata)
+    monkeypatch.setattr(eval_scorer, "parse_trace_bundle", parse_bundle)
+    state = SimpleNamespace(
+        sample_id=sample.id,
+        metadata=metadata,
+        store=FakeStore({TRACE_STORE_KEY: {"trace": "bundle"}}),
+    )
     environment = FakeSandbox()
 
     passing = await score_tests(state, environment)
@@ -1097,7 +1308,7 @@ async def test_grouped_preservation_tests_are_scored_and_reported(monkeypatch) -
                 stderr="",
             )
 
-    async def read_trace(_environment):
+    def parse_bundle(_bundle):
         return SimpleNamespace(
             compact_history_between=lambda start, end: [
                 SimpleNamespace(output_value="D-21.rev2 D-22 retained")
@@ -1105,8 +1316,12 @@ async def test_grouped_preservation_tests_are_scored_and_reported(monkeypatch) -
             ]
         )
 
-    monkeypatch.setattr(eval_scorer, "read_trace_input", read_trace)
-    state = SimpleNamespace(sample_id=sample.id, metadata=sample.metadata)
+    monkeypatch.setattr(eval_scorer, "parse_trace_bundle", parse_bundle)
+    state = SimpleNamespace(
+        sample_id=sample.id,
+        metadata=sample.metadata,
+        store=FakeStore({TRACE_STORE_KEY: {"trace": "bundle"}}),
+    )
     environment = FakeSandbox()
     score = await score_tests(state, environment)
     assert score.value == 1

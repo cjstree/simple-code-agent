@@ -5,19 +5,25 @@
 
 ## 生成位置与生命周期
 
-eval runner 始终把本地 trace 写入 sample sandbox 的 `.eval_traces/`：
+solver 为每个 sample 创建唯一的绝对系统临时根目录，eval runner 把本地 trace 写入其
+`traces/` 子目录：
 
-- `.eval_traces/manifest.jsonl`：每个 session 一条索引；
-- `.eval_traces/trace_log_<session-id>.jsonl`：该 session 的 completed spans。
+- `traces/manifest.jsonl`：每个 session 一条索引；
+- `traces/trace_log_<session-id>.jsonl`：该 session 的 completed spans。
 
-scorer 必须在 Agent 子进程结束后、sandbox 清理前调用
-`code_agent_evals.trace.read_trace_input(environment)`。`context_survival` 等 scorer-only
-metadata 不进入 runner payload，也不会暴露给 Agent。
+该目录位于 Agent 工作目录之外；workspace 中不生成 `.eval_traces/`。runner 完成 Agent
+关闭与 telemetry flush 后，solver 调用
+`code_agent_evals.trace.read_trace_bundle(trace_directory)` 完整读取并校验 manifest 及其
+引用文件，将原始文本 bundle 写入 `TaskState.store["code_agent_eval.trace.v1"]`，随后在
+scorer 运行前删除整个临时根目录。`context_survival` 等 scorer-only metadata 不进入
+runner payload，也不会暴露给 Agent。
 
 ## Python 接口
 
-`read_trace_input` 返回 `EvaluationTrace`。也可以用纯函数
-`parse_trace_jsonl(manifest_jsonl, trace_files)` 解析已读取的文本，便于测试和离线重放。
+scorer 使用 `parse_trace_bundle(state.store.get("code_agent_eval.trace.v1"))` 返回
+`EvaluationTrace`。也可以用纯函数 `parse_trace_jsonl(manifest_jsonl, trace_files)` 解析
+已读取的文本，便于测试和离线重放。bundle 缺失、类型错误、manifest 或引用文件损坏都
+是基础设施失败，不是普通零分。
 
 核心视图如下：
 
