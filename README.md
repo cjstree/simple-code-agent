@@ -22,6 +22,11 @@ line `limit`. To keep large files out of the model context, each result is cappe
 at 2,000 lines or 50 KiB and includes the next `offset` when more text is
 available.
 
+The local shell tool reads output in fixed-size chunks, so commands may emit
+lines of any length. It retains at most 10 KiB of command output; larger output
+keeps equal-sized sections from the beginning and end with a byte-counted
+truncation marker between them.
+
 MCP integration is optional. Set `MCP_URL` to any Streamable HTTP MCP endpoint,
 for example `http://127.0.0.1:8000/mcp`, to discover and add its remote tools. With
 `MCP_URL` unset, the agent has no runtime dependency on the RAG backend.

@@ -14,11 +14,10 @@ from pydantic import BaseModel, Field
 from code_agent.background_manager import BackgroundManager
 from code_agent.skill_registry import SkillRegistry
 
-_RESET = "\033[0m"
-_DIM = "\033[2m"
-
 READ_MAX_LINES = 2000
 READ_MAX_BYTES = 50 * 1024
+BASH_MAX_OUTPUT_BYTES = 10 * 1024
+BASH_READ_CHUNK_BYTES = 16 * 1024
 
 
 def _format_size(size: int) -> str:
@@ -295,51 +294,84 @@ def _grep_files(path: str, pattern: re.Pattern[str]) -> list[str]:
 
 class BashArguments(BaseModel):
     cmd: str
-    run_in_background : bool = False
+    run_in_background: bool = False
 
 
 class BashTool:
     type = "function"
     name = "bash"
-    description = "Run shell command. If you set run_in_background to True, " \
-    "the result will be collected on a later turn."
+    description = (
+        "Run shell command. If you set run_in_background to True, "
+        "the result will be collected on a later turn. Foreground output is "
+        "limited to 100KB; longer output keeps its beginning and end."
+    )
     parameters: ClassVar[dict[str, Any]] = BashArguments.model_json_schema()
     arguments_model = BashArguments
 
-    bgManager : BackgroundManager
+    bgManager: BackgroundManager
 
-    def __init__(self,bgManager : BackgroundManager | None = None):
+    def __init__(self, bgManager: BackgroundManager | None = None):
         self.bgManager = bgManager
-        pass
 
     async def run(self, arguments: dict[str, Any]) -> str:
         args = self.arguments_model.model_validate(arguments)
         if args.run_in_background == True:
             taskID = self.bgManager.start(args.cmd)
-            return (f"[Background task {taskID} started] "
-                    "The result will be collected on a later turn.")
+            return (
+                f"[Background task {taskID} started] "
+                "The result will be collected on a later turn."
+            )
         process = await asyncio.create_subprocess_shell(
             args.cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
-        output_lines: list[str] = []
+        head_limit = BASH_MAX_OUTPUT_BYTES // 3
+        tail_limit = BASH_MAX_OUTPUT_BYTES - head_limit
+        output_head = bytearray()
+        output_tail = bytearray()
+        output_size = 0
 
         async def collect_output() -> None:
+            nonlocal output_size
             assert process.stdout is not None
-            while line := await process.stdout.readline():
-                text = line.decode(errors="replace")
-                print(f"  {_DIM}│ {text.rstrip()}{_RESET}", flush=True)
-                output_lines.append(text)
-            await process.wait()
+            while chunk := await process.stdout.read(BASH_READ_CHUNK_BYTES):
+                output_size += len(chunk)
+                head_remaining = head_limit - len(output_head)
+                if head_remaining > 0:
+                    output_head.extend(chunk[:head_remaining])
+                    chunk = chunk[head_remaining:]
+                if chunk:
+                    output_tail.extend(chunk)
+                    if len(output_tail) > tail_limit:
+                        del output_tail[:-tail_limit]
 
+        async def wait_for_exit() -> None:
+            # Avoid asyncio's lost-wakeup race between checking returncode and
+            # registering a Process.wait() waiter for very short-lived commands.
+            while process.returncode is None:
+                await asyncio.sleep(0.01)
+
+        async def run_process() -> None:
+            await asyncio.gather(collect_output(), wait_for_exit())
+
+        timeout_notice = ""
         try:
-            await asyncio.wait_for(collect_output(), timeout=30)
+            await asyncio.wait_for(run_process(), timeout=30)
         except TimeoutError:
-            process.kill()
-            await process.wait()
-            output_lines.append("\n(timed out after 30s)")
-        return "".join(output_lines).strip() or "(empty)"
+            if process.returncode is None:
+                process.kill()
+                await wait_for_exit()
+            timeout_notice = "\n(timed out after 30s)"
+
+        if output_size > BASH_MAX_OUTPUT_BYTES:
+            omitted_bytes = output_size - BASH_MAX_OUTPUT_BYTES
+            marker = f"\n...({omitted_bytes} bytes truncated)...\n".encode()
+            output = bytes(output_head) + marker + bytes(output_tail)
+        else:
+            output = bytes(output_head) + bytes(output_tail)
+        text = output.decode(errors="replace") + timeout_notice
+        return text.strip() or "(empty)"
 
 
 class LoadSkillsArguments(BaseModel):
