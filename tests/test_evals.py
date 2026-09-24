@@ -917,6 +917,7 @@ def test_constraint_sample_declares_isolated_scoring_contract() -> None:
         "constraint_rollback_compatibility",
         "decision_release_channel_update",
         "entity_route_alias_binding",
+        "tool_result_build_tag",
     }
     sample = samples["constraint_rollback_compatibility"]
     checks = preservation_checks(sample.metadata)
@@ -1145,6 +1146,182 @@ def test_atomic_preservation_samples_and_reference_patches(
     )
     compatibility = run_tests(pass_to_pass)
     assert compatibility.returncode == 0, compatibility.stdout + compatibility.stderr
+
+
+def test_tool_result_fixture_and_reference_patch(tmp_path) -> None:
+    # The probe supplies a value absent from the fixture's target code, and only the reference fix satisfies the exact oracle.
+    sample = {item.id: item for item in context_survival_eval().dataset}[
+        "tool_result_build_tag"
+    ]
+    check = preservation_checks(sample.metadata)[0]
+    assert check.id == "TR-91"
+    assert check.category == "tool_result"
+    assert check.introduced_turn == 1
+    assert check.used_turn == 8
+    assert check.min_compact_hops == 1
+    assert check.source_tool_name == "bash"
+    assert check.source_output_contains == ("TR-91", "plume-0093e087")
+    assert all("plume-0093e087" not in turn for turn in sample.metadata["turns"])
+
+    workspace = tmp_path / str(sample.id)
+    shutil.copytree(Path(sample.files["."]), workspace)
+    project_root = Path(__file__).resolve().parents[1]
+    shutil.copytree(
+        project_root / "evals" / "hidden_tests" / str(sample.id),
+        workspace / ".eval_hidden_tests",
+    )
+    assert "plume-0093e087" not in (workspace / "snapshot_probe.py").read_text()
+    probe = subprocess.run(
+        [sys.executable, "snapshot_probe.py"],
+        cwd=workspace,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert probe.returncode == 0
+    assert "TR-91 build_tag=plume-0093e087" in probe.stdout
+
+    environment = {
+        **os.environ,
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONPATH": str(workspace),
+    }
+
+    def run_tests(selectors):
+        return subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", *selectors],
+            cwd=workspace,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    for group, selectors in check.behavior_groups:
+        for selector in selectors:
+            baseline = run_tests((selector,))
+            assert baseline.returncode == (1 if group == "FAIL_TO_PASS" else 0), (
+                group,
+                selector,
+                baseline.stdout,
+                baseline.stderr,
+            )
+
+    patch = project_root / "evals" / sample.metadata["reference_patch"]
+    applied = subprocess.run(
+        ["git", "apply", str(patch)],
+        cwd=workspace,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+    reference = run_tests(check.behavior_tests)
+    assert reference.returncode == 0, reference.stdout + reference.stderr
+
+
+@pytest.mark.parametrize(
+    ("tool_turn", "tool_name", "tool_output", "summary", "compact", "expected"),
+    [
+        (
+            1,
+            "bash",
+            "TR-91 build_tag=plume-0093e087",
+            "TR-91 plume-0093e087",
+            True,
+            (True, True, 1),
+        ),
+        (
+            2,
+            "bash",
+            "TR-91 build_tag=plume-0093e087",
+            "TR-91 plume-0093e087",
+            True,
+            (True, False, 1),
+        ),
+        (
+            1,
+            "read",
+            "TR-91 build_tag=plume-0093e087",
+            "TR-91 plume-0093e087",
+            True,
+            (True, False, 1),
+        ),
+        (1, "bash", "unrelated output", "TR-91 plume-0093e087", True, (True, False, 1)),
+        (
+            1,
+            "bash",
+            "TR-91 build_tag=plume-0093e087",
+            "TR-91 only",
+            True,
+            (True, False, 1),
+        ),
+        (
+            1,
+            "bash",
+            "TR-91 build_tag=plume-0093e087",
+            "TR-91 plume-0093e087",
+            False,
+            (False, False, 0),
+        ),
+    ],
+)
+def test_tool_result_trace_requires_source_and_one_compact(
+    tool_turn, tool_name, tool_output, summary, compact, expected
+) -> None:
+    # A matching early tool result and one marked summary are both required for trace preservation.
+    sample = {item.id: item for item in context_survival_eval().dataset}[
+        "tool_result_build_tag"
+    ]
+    check = preservation_checks(sample.metadata)[0]
+    spans = []
+    for ordinal in range(1, check.used_turn + 1):
+        spans.append(
+            {
+                "schema_version": 1,
+                "name": "agent.turn",
+                "context": {"trace_id": "trace", "span_id": f"turn-{ordinal}"},
+                "parent_id": None,
+                "start_time": f"2026-09-14T00:{ordinal:02d}:00Z",
+                "end_time": f"2026-09-14T00:{ordinal:02d}:05Z",
+                "attributes": {"session.id": "session"},
+            }
+        )
+    spans.append(
+        {
+            "schema_version": 1,
+            "name": f"tool.{tool_name}",
+            "context": {"trace_id": "trace", "span_id": "probe"},
+            "parent_id": f"turn-{tool_turn}",
+            "start_time": f"2026-09-14T00:{tool_turn:02d}:01Z",
+            "end_time": f"2026-09-14T00:{tool_turn:02d}:02Z",
+            "attributes": {
+                "session.id": "session",
+                "openinference.span.kind": "tool",
+                "tool.name": tool_name,
+                "output.value": tool_output,
+            },
+        }
+    )
+    if compact:
+        spans.append(
+            {
+                "schema_version": 1,
+                "name": "session.compact_history",
+                "context": {"trace_id": "trace", "span_id": "compact"},
+                "parent_id": "turn-4",
+                "start_time": "2026-09-14T00:04:01Z",
+                "end_time": "2026-09-14T00:04:02Z",
+                "attributes": {"session.id": "session", "output.value": summary},
+            }
+        )
+    trace = parse_trace_jsonl(
+        json.dumps(
+            {"schema_version": 1, "session_id": "session", "file": "trace.jsonl"}
+        ),
+        {"trace.jsonl": "\n".join(json.dumps(span) for span in reversed(spans))},
+    )
+    assert preservation_trace_result(check, trace) == expected
 
 
 @pytest.mark.parametrize(

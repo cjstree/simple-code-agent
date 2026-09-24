@@ -75,3 +75,7 @@ compact、非 tool span。评分相关 span 缺少 session 仍属于 trace 格�
 
 如果 sample 未声明 `context_survival`，继续走当前 pytest scorer，不读取 trace，因此
 现有 file-edit eval 的评分行为保持不变。
+
+`tool_result` 检查另声明 `source_tool.name` 和 `source_tool.output_contains`。
+评分器读取 `introduced_turn` 的 `tool_spans`，要求至少一个目标工具 span 的
+`output.value` 包含全部声明片段；否则 `trace_preserved=false`。该来源条件不增加计分权重。

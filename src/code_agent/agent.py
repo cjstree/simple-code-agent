@@ -118,6 +118,7 @@ class Agent:
         telemetry: AgentTelemetry,
         system_prompt: str | None = None,
         memory_path: Path = Path("./memory"),
+        max_tool_round: int = 10
     ):
         self.telemetry = telemetry
         self.session_id = str(uuid.uuid4())
@@ -141,6 +142,7 @@ class Agent:
         self.memory = None
         self.memory_path = memory_path
         self._closed = False
+        self.max_tool_round = max_tool_round
 
     def append_message(
         self,
@@ -248,7 +250,7 @@ class Agent:
                 tools=tool_list,
                 sensitive_tools={"bash", "edit", "write"},
             )
-            self.max_tool_round = 5
+
         except BaseException:
             await exit_stack.aclose()
             raise

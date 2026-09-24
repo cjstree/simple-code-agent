@@ -51,6 +51,8 @@ class PreservationCheck:
     summary_contains: tuple[str, ...]
     behavior_tests: tuple[str, ...]
     behavior_groups: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    source_tool_name: str | None = None
+    source_output_contains: tuple[str, ...] = ()
 
 
 def preservation_checks(
@@ -137,6 +139,32 @@ def preservation_checks(
             raise ValueError("behavior_tests must be a non-empty list or test groups")
         if len(validated_selectors) != len(set(validated_selectors)):
             raise ValueError("behavior_tests contains duplicate selectors")
+        source_tool = item.get("source_tool")
+        source_tool_name = None
+        source_output_contains: tuple[str, ...] = ()
+        if category == "tool_result":
+            if not isinstance(source_tool, dict) or set(source_tool) != {
+                "name",
+                "output_contains",
+            }:
+                raise ValueError(
+                    "tool_result checks require source_tool name and output_contains"
+                )
+            source_tool_name = source_tool["name"]
+            fragments = source_tool["output_contains"]
+            if not isinstance(source_tool_name, str) or not source_tool_name.strip():
+                raise ValueError("source_tool.name must be a non-empty string")
+            if (
+                not isinstance(fragments, list)
+                or not fragments
+                or any(not isinstance(value, str) or not value for value in fragments)
+            ):
+                raise ValueError(
+                    "source_tool.output_contains must be non-empty strings"
+                )
+            source_output_contains = tuple(fragments)
+        elif source_tool is not None:
+            raise ValueError("source_tool is only valid for tool_result checks")
         checks.append(
             PreservationCheck(
                 check_id,
@@ -147,9 +175,29 @@ def preservation_checks(
                 tuple(markers),
                 validated_selectors,
                 behavior_groups,
+                source_tool_name,
+                source_output_contains,
             )
         )
     return tuple(checks)
+
+
+def source_tool_observed(check: PreservationCheck, trace: EvaluationTrace) -> bool:
+    """Confirm the introduced fact appeared in an actual tool result."""
+    if check.source_tool_name is None:
+        return True
+    try:
+        tool_spans = trace.turn(check.introduced_turn).tool_spans
+    except IndexError as error:
+        raise TraceFormatError(
+            f"trace lacks declared source turn for {check.id}"
+        ) from error
+    return any(
+        span.attributes.get("tool.name") == check.source_tool_name
+        and isinstance(span.output_value, str)
+        and all(value in span.output_value for value in check.source_output_contains)
+        for span in tool_spans
+    )
 
 
 def preservation_trace_result(
@@ -163,10 +211,14 @@ def preservation_trace_result(
         ) from error
     activated = len(compacts) >= check.min_compact_hops
     # Every required marker must survive each hop, including the last summary.
-    preserved = activated and all(
-        isinstance(span.output_value, str)
-        and all(marker in span.output_value for marker in check.summary_contains)
-        for span in compacts
+    preserved = (
+        activated
+        and source_tool_observed(check, trace)
+        and all(
+            isinstance(span.output_value, str)
+            and all(marker in span.output_value for marker in check.summary_contains)
+            for span in compacts
+        )
     )
     return activated, preserved, len(compacts)
 
@@ -273,6 +325,7 @@ async def score_tests(state: TaskState, environment: SandboxEnvironment) -> Scor
         explanations = []
         for check in checks:
             activated, preserved, compact_hops = preservation_trace_result(check, trace)
+            source_observed = source_tool_observed(check, trace)
             tests = []
             for selector in check.behavior_tests:
                 test_result = await _run_pytest(environment, (selector,))
@@ -322,6 +375,11 @@ async def score_tests(state: TaskState, environment: SandboxEnvironment) -> Scor
                     "trace_preserved": {
                         "passed": preserved,
                         "score": _PRESERVATION_WEIGHT if preserved else 0.0,
+                        **(
+                            {"source_tool_observed": source_observed}
+                            if check.source_tool_name is not None
+                            else {}
+                        ),
                     },
                     "behavior": behavior,
                 }

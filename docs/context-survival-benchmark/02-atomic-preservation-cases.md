@@ -24,14 +24,16 @@ hidden tests 应分别对应具体要求，避免只给整个 patch 一个无法
 - 每个被评分的事实只引入一次，最终 turn 不再重复具体值。
 - 使用 `C-11`、`D-21.rev2`、`TR-91` 等稳定且不敏感的标记支持确定性 trace 断言；
   语义正确性仍由行为测试判断。
-- 信息引入与使用之间至少经过两个 compact hop。
+- 信息引入与使用之间的 compact hop 数由样例声明；tool-result 首例要求至少一次，
+  其他现有原子样例要求至少两次。
 - 保持代码任务简单，并用明确测试捕获 entity 交换或旧 decision 被采用的情况。
 - decision update 的 summary 可以记录旧决定已被替代；评分关注当前 revision 和最终行为。
-- tool-result 样例需要从 trace 确认 Agent 确实通过目标工具输出获得了信息。
+- tool-result 样例需要从引入轮的目标 tool span 确认 Agent 确实通过工具输出获得了信息。
 
 ## 验收标准
 
 - 原始 fixture 的目标回归测试失败，兼容性测试通过。
 - reference patch 通过全部行为检查。
-- 每个原子样例在 benchmark 配置下都能激活预期 trace 路径。
+- 正式运行 benchmark 后，每个原子样例都应在其配置下激活预期 trace 路径；
+  未运行真实 eval 的样例须标明激活尚未验证。
 - 失败结果能够定位到类别和具体 preserve 检查。

@@ -1,0 +1,11 @@
+diff --git a/release_policy.py b/release_policy.py
+--- a/release_policy.py
++++ b/release_policy.py
+@@ -1,6 +1,6 @@
+ from manifest_models import Manifest
+ 
+ _BUILD_TAGS = {
+-    "published": "",
++    "published": "plume-0093e087",
+     "preview": "preview-only",
+ }
