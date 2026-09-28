@@ -10,6 +10,7 @@ from pathlib import Path
 from code_agent.agent import Agent
 from code_agent.settings import settings
 from code_agent.telemetry import AgentTelemetry
+from code_agent_evals.long_horizon import capture_checkpoint, validate_checkpoint_turns
 
 _SESSION_CONFIG_FIELDS = {
     "compact_thresh_hold",
@@ -117,8 +118,12 @@ async def run(
     restart_agent_after_turns: tuple[int, ...] = (),
     *,
     runtime_root: Path,
+    checkpoint_turns: tuple[int, ...] = (),
 ) -> str:
     """Run evaluation turns, optionally restarting Agent between episodes."""
+    if checkpoint_turns:
+        validate_checkpoint_turns(list(checkpoint_turns), len(turns))
+    checkpoints = {}
     traces_path, memory_path = prepare_runtime_directories(runtime_root)
     telemetry = AgentTelemetry.initialize(
         enabled=settings.phoenix_enabled,
@@ -154,6 +159,11 @@ async def run(
                 result = await agent.run(turn, new_session=first_turn_for_agent)
                 first_turn_for_agent = False
                 turn_number = index + 1
+                if turn_number in checkpoint_turns:
+                    checkpoints[str(turn_number)] = capture_checkpoint(Path.cwd())
+                    (runtime_root / "checkpoints.json").write_text(
+                        json.dumps(checkpoints)
+                    )
                 if turn_number in restart_agent_after_turns:
                     await agent.close()
                     agent = None
@@ -170,8 +180,13 @@ async def run(
 
 def main() -> None:
     """Read an evaluation payload and write only the final answer to stdout."""
-    turns, agent_config, restart_agent_after_turns, runtime_root = parse_payload(
-        sys.stdin.read()
+    raw = sys.stdin.read()
+    turns, agent_config, restart_agent_after_turns, runtime_root = parse_payload(raw)
+    raw_checkpoints = json.loads(raw).get("checkpoint_turns", [])
+    checkpoints = (
+        validate_checkpoint_turns(raw_checkpoints, len(turns))
+        if raw_checkpoints
+        else ()
     )
     result = asyncio.run(
         run(
@@ -179,6 +194,7 @@ def main() -> None:
             agent_config,
             restart_agent_after_turns,
             runtime_root=runtime_root,
+            checkpoint_turns=checkpoints,
         )
     )
     print(result)

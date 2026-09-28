@@ -8,6 +8,7 @@ from inspect_ai.model import ModelOutput
 from inspect_ai.solver import Generate, Solver, TaskState, solver
 from inspect_ai.util import sandbox
 
+from code_agent_evals.long_horizon import CHECKPOINT_STORE_KEY, checkpoint_turns
 from code_agent_evals.trace import (
     TRACE_STORE_KEY,
     read_trace_bundle,
@@ -22,9 +23,11 @@ def _runner_payload(state: TaskState, runtime_root: Path) -> str:
     turns = metadata.get("turns", [state.input_text])
     agent_config = metadata.get("agent_config", {})
     restart_agent_after_turns = metadata.get("restart_agent_after_turns", [])
+    checkpoints = checkpoint_turns(metadata)
     return json.dumps(
         {
             "turns": turns,
+            **({"checkpoint_turns": list(checkpoints)} if checkpoints else {}),
             "agent_config": agent_config,
             "restart_agent_after_turns": restart_agent_after_turns,
             "eval_runtime_root": str(runtime_root),
@@ -62,6 +65,11 @@ def my_agent_solver() -> Solver:
                 raise RuntimeError(f"Agent subprocess failed:\n{details}")
 
             state.store.set(TRACE_STORE_KEY, read_trace_bundle(runtime_root / "traces"))
+            if checkpoint_turns(state.metadata or {}):
+                state.store.set(
+                    CHECKPOINT_STORE_KEY,
+                    json.loads((runtime_root / "checkpoints.json").read_text()),
+                )
             state.output = ModelOutput.from_content(
                 model="my-agent",
                 content=result.stdout.strip(),

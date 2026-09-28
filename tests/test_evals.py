@@ -351,6 +351,7 @@ async def test_runner_executes_turns_in_one_agent_session(
             return None
 
         async def run(self, turn: str, *, new_session: bool = True) -> str:
+            Path("example.py").write_text(f"value = {turn!r}\n")
             self.calls.append((turn, new_session))
             return f"answer: {turn}"
 
@@ -376,6 +377,7 @@ async def test_runner_executes_turns_in_one_agent_session(
         ["first", "second", "third"],
         {"compact_thresh_hold": 500},
         runtime_root=runtime_root,
+        checkpoint_turns=(1, 3),
     )
 
     assert result == "answer: third"
@@ -389,6 +391,12 @@ async def test_runner_executes_turns_in_one_agent_session(
     assert telemetry_settings[0]["trace_log_dir"] == runtime_root / "traces"
     assert agents[0].memory_path == runtime_root / "memory"
     assert not (Path.cwd() / ".eval_traces").exists()
+
+    snapshots = json.loads((runtime_root / "checkpoints.json").read_text())
+    assert snapshots == {
+        "1": {"example.py": "value = 'first'\n"},
+        "3": {"example.py": "value = 'third'\n"},
+    }
 
 
 @pytest.mark.asyncio
@@ -918,6 +926,7 @@ def test_constraint_sample_declares_isolated_scoring_contract() -> None:
         "decision_release_channel_update",
         "entity_route_alias_binding",
         "tool_result_build_tag",
+        "mixed_release_long_horizon",
     }
     sample = samples["constraint_rollback_compatibility"]
     checks = preservation_checks(sample.metadata)
@@ -1530,3 +1539,43 @@ def test_grouped_preservation_contract_rejects_missing_or_duplicate_tests() -> N
     groups["PASS_TO_PASS"] = groups["FAIL_TO_PASS"][:1]
     with pytest.raises(ValueError, match="duplicate selectors"):
         preservation_checks(metadata)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", [False, True])
+async def test_solver_transports_checkpoints_before_cleanup(monkeypatch, missing):
+    # Stage files survive in the store; missing evidence still cleans the runtime.
+    from code_agent_evals.long_horizon import CHECKPOINT_STORE_KEY
+
+    roots = []
+    bundle = {"12": {}, "18": {}, "24": {"module.py": "value = 3"}}
+
+    class SnapshotSandbox:
+        async def exec(self, command, **kwargs):
+            payload = json.loads(kwargs["input"])
+            root = Path(payload["eval_runtime_root"])
+            roots.append(root)
+            assert payload["checkpoint_turns"] == [12, 18, 24]
+            assert kwargs["timeout"] == 3600
+            _write_valid_trace(root)
+            if not missing:
+                (root / "checkpoints.json").write_text(json.dumps(bundle))
+            return SimpleNamespace(success=True, stdout="done", stderr="")
+
+    monkeypatch.setattr(eval_solver, "sandbox", lambda: SnapshotSandbox())
+    sample = next(
+        s
+        for s in context_survival_eval().dataset
+        if s.id == "mixed_release_long_horizon"
+    )
+    state = SimpleNamespace(
+        input_text=sample.input, metadata=sample.metadata, store=FakeStore()
+    )
+    if missing:
+        with pytest.raises(FileNotFoundError):
+            await eval_solver.my_agent_solver()(state, None)
+        assert state.store.get(CHECKPOINT_STORE_KEY) is None
+    else:
+        await eval_solver.my_agent_solver()(state, None)
+        assert state.store.get(CHECKPOINT_STORE_KEY) == bundle
+    assert len(roots) == 1 and not roots[0].exists()

@@ -315,6 +315,10 @@ async def score_tests(state: TaskState, environment: SandboxEnvironment) -> Scor
     checks = preservation_checks(state.metadata)
     if checks is not None:
         trace = parse_trace_bundle(state.store.get(TRACE_STORE_KEY))
+        from code_agent_evals.long_horizon import checkpoint_turns, score_long_horizon
+
+        if checkpoint_turns(state.metadata):
+            return await score_long_horizon(state, environment, checks, trace)
         if any(
             selector.startswith(f"{_HIDDEN_TESTS_DESTINATION}/")
             for check in checks

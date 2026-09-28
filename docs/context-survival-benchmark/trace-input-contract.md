@@ -79,3 +79,12 @@ compact、非 tool span。评分相关 span 缺少 session 仍属于 trace 格�
 `tool_result` 检查另声明 `source_tool.name` 和 `source_tool.output_contains`。
 评分器读取 `introduced_turn` 的 `tool_spans`，要求至少一个目标工具 span 的
 `output.value` 包含全部声明片段；否则 `trace_preserved=false`。该来源条件不增加计分权重。
+
+## 长程样例的阶段证据
+
+`long_horizon_v1` 在 trace bundle 之外使用
+`TaskState.store["code_agent_eval.checkpoints.v1"]`：键为 checkpoint 轮次字符串，
+值为相对 Python 文件名到 UTF-8 内容的映射。Runner 在对应轮返回后写入独立 runtime，
+Solver 在清理前转存。缺失阶段、非法路径或格式错误属于基础设施错误。
+该 profile 的 compact/summary 信息只作诊断，主分由阶段行为决定；详见
+[综合长程样例](mixed-release-long-horizon-case.md)。

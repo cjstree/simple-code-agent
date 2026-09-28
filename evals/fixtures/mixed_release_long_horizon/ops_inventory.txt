@@ -1,0 +1,12 @@
+box-01 ready
+box-02 queued
+box-03 ready
+box-04 blocked
+box-05 ready
+box-06 queued
+box-07 blocked
+box-08 ready
+box-09 queued
+box-10 ready
+box-11 blocked
+box-12 ready

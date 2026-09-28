@@ -47,7 +47,7 @@ tool call/result 配对、持久化文件内容完整等底层 compact 不变量
 
 ## 当前可运行样例
 
-`evals/context_survival.jsonl` 目前包含四个独立原子样例：
+`evals/context_survival.jsonl` 目前包含四个独立原子样例和一个综合长程样例。原子样例为：
 [`constraint_rollback_compatibility`](constraint-rollback-compatibility-case.md)、
 [`decision_release_channel_update`](decision-release-channel-update-case.md) 和
 [`entity_route_alias_binding`](entity-route-alias-binding-case.md)，以及
@@ -116,3 +116,12 @@ uv run inspect eval src/code_agent_evals/tasks.py@context_survival_eval \
 若未达到两次，结果会明确显示 `activated=false`，不会误记为通过。
 该样例在 metadata 中设置 `runner_timeout_seconds=720`，为增加的调查回合留出执行时间；
 其他样例继续使用 300 秒默认值。此字段仅供 solver 设置 runner 超时，不传给 Agent。
+
+### 第五例：综合长程任务
+
+[`mixed_release_long_horizon`](mixed-release-long-horizon-case.md) 将四个 fixture 放在同一
+工作区，以 24 轮交错任务在第 12、18、24 轮保存实现快照，复用全部 8 项行为合同。
+使用 `long_horizon_v1`：四类能力等权、三个阶段等权，主分只取行为测试结果；另报
+pass→fail 漂移率、最终分和最差阶段分。compact 次数和摘要标记仅用于诊断，不计分。
+因此中途退化后最终修好，仍无法获得满分。未触发 compact 的运行会明确标注，不能
+作为 compact 后能力的证据。详见样例文档中的公式、限制及运行命令。

@@ -1,0 +1,103 @@
+diff --git a/deployment_api.py b/deployment_api.py
+--- a/deployment_api.py
++++ b/deployment_api.py
+@@ -6,11 +6,11 @@
+     payload: dict[str, str],
+ ) -> dict[str, str]:
+     # Older callers send only deployment_id. Their reason is "unspecified".
+-    if "reason" in payload:
+-        deployment = service.rollback(payload["deployment_id"], payload["reason"])
+-    else:
+-        deployment = service.rollback(payload["deployment_id"])
++    deployment = service.rollback(
++        payload["deployment_id"], payload.get("reason", "unspecified")
++    )
+     return {
+         "deployment_id": deployment.deployment_id,
+         "status": deployment.status,
++        "rollback_reason": deployment.rollback_reason,
+     }
+diff --git a/deployment_repository.py b/deployment_repository.py
+--- a/deployment_repository.py
++++ b/deployment_repository.py
+@@ -8,16 +8,18 @@
+         self._rows = {row["deployment_id"]: dict(row) for row in rows}
+ 
+     def save(self, deployment: Deployment) -> None:
+-        self._rows[deployment.deployment_id] = {
+-            "deployment_id": deployment.deployment_id,
+-            "status": deployment.status,
+-        }
++        row = self._rows.setdefault(
++            deployment.deployment_id, {"deployment_id": deployment.deployment_id}
++        )
++        row["status"] = deployment.status
++        row["rollback_reason"] = deployment.rollback_reason
+ 
+     def get(self, deployment_id: str) -> Deployment:
+         row = self._rows[deployment_id]
+         return Deployment(
+             deployment_id=row["deployment_id"],
+             status=row["status"],
++            rollback_reason=row.get("rollback_reason"),
+         )
+ 
+     def export_row(self, deployment_id: str) -> dict[str, str]:
+diff --git a/deployment_service.py b/deployment_service.py
+--- a/deployment_service.py
++++ b/deployment_service.py
+@@ -14,7 +14,11 @@
+ 
+     def rollback(self, deployment_id: str, reason: str) -> Deployment:
+         deployment = self.repository.get(deployment_id)
++        if deployment.status == "rolled_back":
++            return deployment
++
+         deployment.status = "rolled_back"
++        deployment.rollback_reason = reason
+         self.repository.save(deployment)
+         self.audit_log.record("deployment_rolled_back", deployment_id)
+         return deployment
+diff --git a/release_policy.py b/release_policy.py
+--- a/release_policy.py
++++ b/release_policy.py
+@@ -8,8 +8,8 @@
+ 
+ 
+ _POLICIES = {
+-    "regular": ReleasePolicy("legacy", ""),
+-    "hotfix": ReleasePolicy("legacy", ""),
++    "regular": ReleasePolicy("staged", "KITE-407"),
++    "hotfix": ReleasePolicy("emergency", "KITE-407"),
+     "preview": ReleasePolicy("pilot", ""),
+ }
+ 
+diff --git a/route_catalog.py b/route_catalog.py
+--- a/route_catalog.py
++++ b/route_catalog.py
+@@ -1,10 +1,12 @@
+ _BUCKETS = {
+-    "invoice-api-eu": "legacy",
+-    "invoice-api-us": "legacy",
++    "invoice-api-eu": "violet-17",
++    "invoice-api-us": "amber-42",
+     "invoice-api-apac": "archive-04",
+ }
+ _ALIASES = {
+     "line-c": "invoice-api-apac",
++    "line-b": "invoice-api-eu",
++    "line-a": "invoice-api-us",
+ }
+ _KNOWN_ALIAS_NAMES = {"line-a", "line-b"}
+ 
+diff --git a/snapshot_policy.py b/snapshot_policy.py
+--- a/snapshot_policy.py
++++ b/snapshot_policy.py
+@@ -1,6 +1,6 @@
+ from manifest_models import Manifest
+ 
+ _BUILD_TAGS = {
+-    "published": "",
++    "published": "plume-0093e087",
+     "preview": "preview-only",
+ }

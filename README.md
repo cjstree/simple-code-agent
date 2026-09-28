@@ -107,6 +107,19 @@ Eval runner 不使用 Inspect model bridge。Agent 按常规 CLI 配置直接连
 
 如需在 Phoenix 中观察 eval，继续使用 Agent 自身的追踪配置：
 
+先在项目根目录启动 Phoenix 服务：
+
+```bash
+docker compose up -d phoenix
+```
+
+打开 `http://localhost:6006` 查看 trace。服务使用 Docker 命名卷 `phoenix_data`
+保存 SQLite 数据；`docker compose down` 后再次启动，历史 trace 仍可查看。
+不要使用 `docker compose down -v`，该命令会删除包含历史 trace 的卷。
+服务直接使用 Phoenix 官方镜像，无需本地构建镜像。
+
+在项目 `.env` 中启用导出：
+
 ```dotenv
 PHOENIX_ENABLED=true
 PHOENIX_COLLECTOR_ENDPOINT=http://localhost:6006/v1/traces
