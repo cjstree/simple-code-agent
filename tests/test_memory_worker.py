@@ -5,6 +5,7 @@ from typing import Any
 
 import pytest
 
+from code_agent.agent import Agent
 from code_agent.memory import Memory
 from code_agent.telemetry import AgentTelemetry
 
@@ -79,3 +80,65 @@ async def test_memory_timeout_cancels_running_task_and_discards_queue(tmp_path) 
     assert len(calls) == 1
     assert "user: first" in calls[0]
     assert memory._extract_task is not None and memory._extract_task.done()
+
+
+@pytest.mark.asyncio
+async def test_queued_extractions_keep_their_triggering_turn(tmp_path) -> None:
+    # Later queued work belongs to its own turn, and shutdown work belongs to the session.
+    pytest.importorskip("opentelemetry.sdk")
+    pytest.importorskip("openinference.instrumentation")
+    pytest.importorskip("openinference.instrumentation.openai")
+    telemetry = AgentTelemetry.initialize(
+        enabled=False,
+        endpoint="http://localhost:6006/v1/traces",
+        project_name="test-project",
+        trace_log_dir=tmp_path / "traces",
+    )
+
+    class EmptyCompletions:
+        async def create(self, **request: Any) -> Any:
+            del request
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="[]"))]
+            )
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=EmptyCompletions()))
+    memory = Memory(path=tmp_path / "memory", client=client, telemetry=telemetry)
+    agent = Agent(telemetry=telemetry, system_prompt="system")
+    agent.session_id = "session-1"
+    agent.memory = memory
+    try:
+        with telemetry.trace_turn(session_id="session-1", prompt="first"):
+            agent.append_message({"role": "user", "content": "first"})
+            agent.create_extract_task()
+        with telemetry.trace_turn(session_id="session-1", prompt="second"):
+            agent.append_message({"role": "user", "content": "second"})
+            agent.create_extract_task()
+        await agent.close()
+    finally:
+        telemetry.shutdown()
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "traces" / "trace_log_session-1.jsonl")
+        .read_text()
+        .splitlines()
+    ]
+    turns = {
+        record["attributes"]["input.value"]: record["context"]["span_id"]
+        for record in records
+        if record["name"] == "agent.turn"
+    }
+    extracts = [record for record in records if record["name"] == "memory.extract"]
+    assert len(extracts) == 3
+    assert [record["parent_id"] for record in extracts] == [
+        turns["first"], turns["second"], None
+    ]
+    assert [
+        json.loads(record["attributes"]["input.value"])[-1]["content"]
+        for record in extracts
+    ] == ["first", "second", "second"]
+    assert all(
+        record["attributes"]["session.id"] == "session-1"
+        for record in extracts
+    )

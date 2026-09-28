@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import re
+from contextvars import Context, copy_context
 from pathlib import Path
 from typing import Any
 
@@ -66,11 +67,15 @@ class Memory :
         self.path = path
         self.client = client
         self.telemetry = telemetry if telemetry is not None else AgentTelemetry()
-        self._extract_queue: asyncio.Queue[list[dict[str, Any]] | None] = asyncio.Queue()
+        self._extract_queue: asyncio.Queue[
+            tuple[list[dict[str, Any]], Context, str | None] | None
+        ] = asyncio.Queue()
         self._extract_task: asyncio.Task[None] | None = None
         self._closed = False
 
-    def schedule_extract(self, messages: list[dict[str, Any]]) -> None:
+    def schedule_extract(
+        self, messages: list[dict[str, Any]], *, session_id: str | None = None
+    ) -> None:
         """Queue a context snapshot for extraction without waiting for the model."""
         if self._closed:
             raise RuntimeError("memory extraction is closed")
@@ -79,7 +84,7 @@ class Memory :
         elif self._extract_task.done():
             self._extract_task.result()
             raise RuntimeError("memory extraction has stopped")
-        self._extract_queue.put_nowait(messages)
+        self._extract_queue.put_nowait((messages, copy_context(), session_id))
 
     async def close(self, *, timeout: float) -> bool:
         """Drain queued extraction, or cancel it when the deadline expires."""
@@ -98,7 +103,16 @@ class Memory :
         return True
 
     async def _run_extract_queue(self) -> None:
-        while (messages := await self._extract_queue.get()) is not None:
+        while (request := await self._extract_queue.get()) is not None:
+            messages, trace_context, session_id = request
+            await asyncio.create_task(
+                self._extract_in_session(messages, session_id), context=trace_context
+            )
+
+    async def _extract_in_session(
+        self, messages: list[dict[str, Any]], session_id: str | None
+    ) -> None:
+        with self.telemetry.session_scope(session_id):
             await self.extract_memories(messages)
 
     # extract memory from current messages.

@@ -240,6 +240,17 @@ class AgentTelemetry:
             return cls()
 
     @contextmanager
+    def session_scope(self, session_id: str | None):
+        """Set the session for background work without assigning it to a turn."""
+        session_context = (
+            self._using_session(session_id)
+            if session_id is not None and self._using_session is not None
+            else nullcontext()
+        )
+        with session_context:
+            yield
+
+    @contextmanager
     def trace_turn(self, *, session_id: str, prompt: str):
         """Trace one user turn and propagate its session to all child spans."""
         if self._tracer is None:

@@ -206,7 +206,9 @@ class Agent:
     def create_extract_task(self) -> None:
         if self.memory is None or not self.session.entrys:
             return
-        self.memory.schedule_extract(self.session.build_context())
+        self.memory.schedule_extract(
+            self.session.build_context(), session_id=self.session_id
+        )
 
     async def start(self):
         if not settings.llm_api_key or not settings.llm_model_name:

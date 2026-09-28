@@ -54,6 +54,11 @@ trace ID. Writes are synchronous, so line order follows span completion rather
 than span start time; consumers should use timestamps and parent span IDs when
 reconstructing execution order.
 
+Queued `memory.extract` spans use the trace context of the turn that queued
+each extraction, even if processing finishes after that turn. The final
+extraction queued during Agent shutdown belongs to the session and has no turn
+parent.
+
 Each completed `agent.turn` span records `agent.stop_reason`,
 `agent.tool_rounds`, `agent.max_tool_rounds`, and `llm.finish_reason`. When the
 Agent stops because it has exhausted the configured tool-call rounds,
