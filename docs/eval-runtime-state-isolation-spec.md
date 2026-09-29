@@ -194,7 +194,7 @@ runner 诊断或下一轮 Agent 上下文。
 
 实现完成时必须同步更新：
 
-- `README.md` 中关于 fixture `memory/` 自动读取和本地 trace 位置的描述；
+- `docs/file-edit-evaluation.md` 中关于 fixture `memory/` 自动读取和 eval trace 位置的描述，以及 `docs/tracing.md` 中 CLI 本地 trace 位置的描述；
 - `docs/context-survival-benchmark/trace-input-contract.md` 中 `.eval_traces/` 的生成位置
   与 scorer 读取方式；
 - eval runner、solver、trace reader 和 memory restart 相关测试说明。
